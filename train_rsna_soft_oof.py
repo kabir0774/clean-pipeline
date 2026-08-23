@@ -115,7 +115,7 @@ def train_fold(k, train_df, val_df, series, root, cfg, architecture, out, dino_s
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--root',required=True);p.add_argument('--labels-dir',required=True);p.add_argument('--output',required=True)
+    p.add_argument('--root',required=True);p.add_argument('--labels-dir',required=True);p.add_argument('--output',required=True);p.add_argument('--study-list',default=None,help='optional CSV with StudyInstanceUID for an isolated smoke subset')
     p.add_argument('--architecture',choices=['resnet18','convnext_tiny','efficientnet_v2_s','dinov2','dinov2_small','radimagenet_resnet50'],default='resnet18')
     p.add_argument('--dino-source','--dinov2-source',dest='dino_source',default=None,help='local DINOv2 model directory or approved model ID')
     p.add_argument('--dino-train-last-blocks','--dinov2-train-last-blocks',dest='dino_train_last_blocks',type=int,default=4)
@@ -125,9 +125,18 @@ def main():
     a=p.parse_args(); seed_everything(a.seed);out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     cfg=Config(root=a.root,labels_csv='',output=a.output,seed=a.seed,image_size=a.image_size,slices_per_slot=a.slices_per_slot,slice_sampling=a.slice_sampling,middle_fraction=a.middle_fraction,canonicalize_laterality=not a.no_laterality_canonicalization,geometry_log=a.geometry_log,batch_size=a.batch_size,workers=a.workers,epochs=a.epochs,lr=a.lr,weight_decay=a.weight_decay,pretrained=not a.no_pretrained,compile=a.compile)
     series=pd.read_csv(Path(a.root)/'train_series.csv',dtype={'StudyInstanceUID':str,'SeriesInstanceUID':str})
+    subset_ids=None
+    if a.study_list:
+        subset_ids=set(pd.read_csv(a.study_list,dtype={'StudyInstanceUID':str})['StudyInstanceUID'].astype(str))
+        if len(subset_ids)==0: raise ValueError('--study-list is empty')
+        print(f'Using isolated study subset: {len(subset_ids)}')
     oof_rows=[]
     for k in range(5):
         labels=pd.read_csv(Path(a.labels_dir)/f'labels_fold_{k}.csv',dtype={'StudyInstanceUID':str})
+        if subset_ids is not None:
+            labels=labels[labels.StudyInstanceUID.astype(str).isin(subset_ids)].reset_index(drop=True)
+            gold_count=int(labels.is_gold.eq(1).sum())
+            if gold_count != 58: raise ValueError(f'study subset must include all 58 gold studies; found {gold_count}')
         required=['StudyInstanceUID','is_gold','train_enabled','outer_fold',*TARGETS,*[f'{t}__confidence' for t in TARGETS]]
         miss=[c for c in required if c not in labels];
         if miss: raise ValueError(f'fold {k} labels missing {miss}')
