@@ -1,0 +1,13 @@
+# Competition data and private/generated artifacts
+DATA/
+labels/*.csv
+pretrained/
+runs/
+logs/
+fold_safe_labels/
+*.dcm
+*.pt
+*.pth
+*.bin
+*.safetensors
+__pycache__/

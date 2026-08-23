@@ -1,0 +1,21 @@
+# RSNA Knee clean pipeline - confirmed SSH layout
+# Server root: /home/harleen_ece/rsna_knee_ai
+
+server_root: /home/harleen_ece/rsna_knee_ai
+data_root: /home/harleen_ece/rsna_knee_ai/DATA
+pipeline_root: /home/harleen_ece/rsna_knee_ai/clean_pipeline
+labels_dir: /home/harleen_ece/rsna_knee_ai/clean_pipeline/labels
+folds_dir: /home/harleen_ece/rsna_knee_ai/clean_pipeline/fold_safe_labels
+runs_dir: /home/harleen_ece/rsna_knee_ai/clean_pipeline/runs
+dinov2_source: /home/harleen_ece/rsna_knee_ai/DINOv2/dinov2-small
+radimagenet_checkpoint: /home/harleen_ece/rsna_knee_ai/clean_pipeline/pretrained/radimagenet/ResNet50.pt
+radimagenet_sha256: 08629f7e7bd3e29b8ee9522ca3f65ce4d010a7ddf74f0ea3c7e3f3d0bbab0734
+
+# Clean-run policy: do not read inherited artifacts.
+forbidden_roots:
+  - /home/harleen_ece/rsna_knee_ai/AI-MODEL
+  - /home/harleen_ece/rsna_knee_ai/rsnav4_ssh
+  - /home/harleen_ece/rsna_knee_ai/rsna_aryan_ssh
+  - /home/harleen_ece/rsna_knee_ai/parser
+  - /home/harleen_ece/rsna_knee_ai/kaggle_run
+  - /home/harleen_ece/rsna_knee_ai/rsnav4_ssh.zip
