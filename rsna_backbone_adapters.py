@@ -33,6 +33,18 @@ def load_radimagenet_resnet50(checkpoint: str, expected_sha256: str | None = Non
     state=payload.get('state_dict',payload) if isinstance(payload,dict) else payload
     if not isinstance(state,dict): raise ValueError('checkpoint is not a state dict')
     state={str(k).removeprefix('module.').removeprefix('backbone.'):v for k,v in state.items()}
+    # Some legitimate RadImageNet exports store torchvision children in a
+    # Sequential backbone: 0=conv1, 1=bn1, 4..7=layer1..layer4, 8=avgpool.
+    child_map={'0':'conv1','1':'bn1','4':'layer1','5':'layer2','6':'layer3','7':'layer4','8':'avgpool'}
+    remapped={}
+    for k,v in state.items():
+        head=k.split('.',1)[0]
+        if head in child_map:
+            tail=k[len(head):].lstrip('.')
+            remapped[child_map[head] + ('.'+tail if tail else '')]=v
+        else:
+            remapped[k]=v
+    state=remapped
     model=resnet50(weights=None)
     # Encoder-only use: discard classifier if present; require convolutional keys.
     state={k:v for k,v in state.items() if not k.startswith('fc.')}
