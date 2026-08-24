@@ -916,6 +916,21 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
+    # AutoModel is loaded in FP16 for memory-efficient inference, but CUDA
+    # GradScaler cannot unscale gradients stored directly in FP16 parameters.
+    # Keep only the small trainable part of the vision tower in FP32; frozen
+    # parameters remain FP16 and autocast still provides mixed-precision
+    # execution. This is the standard master-weight arrangement and costs
+    # little additional memory because only the last blocks are trainable.
+    for param in model.vision_model.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+    trainable_dtypes = {param.dtype for param in model.vision_model.parameters()
+                        if param.requires_grad}
+    if trainable_dtypes != {torch.float32}:
+        raise RuntimeError(f"Stage A0 trainable vision parameters must be FP32; got {trainable_dtypes}")
+    print("  Stage A0 trainable vision parameters kept in FP32; CUDA autocast remains enabled")
+
     rng = np.random.default_rng(seed)
     shuffled = pretrain_ids.copy()
     rng.shuffle(shuffled)
@@ -1998,68 +2013,3 @@ def main():
 
     print("\n── TEST: Embed ──")
     processor, model_enc, device_enc = load_medsiglip()
-    test_emb_idx = embed_slots(test_slots, test_dcm, processor, model_enc,
-                                device_enc, test_lat, EMB_DIR / "test")
-    if "model_enc" in dir(): del model_enc
-    torch.cuda.empty_cache()
-
-    print("\n── TEST: Inference ──")
-    model_paths = sorted(MODEL_DIR.glob("fold_*.pt"))
-    study_ids, preds = run_inference(test_emb_idx, model_paths, device)
-
-    # ── TEST: XGBoost stacking prediction + blend with NN ──
-    final_preds = preds
-    if xgb_ok and best_alpha < 1.0 and xgb_pca is not None and xgb_stage_b_models:
-        try:
-            print("\n── TEST: XGBoost stacking prediction ──")
-            raw_embed_t, presence_t = build_tabular_matrix(study_ids, test_emb_idx)
-
-            # Stage A meta-features for test studies — average across Stage A folds
-            X_stage_a_t = make_features(raw_embed_t, presence_t, xgb_pca)
-            meta_t = np.zeros((len(study_ids), len(TARGETS)), dtype=np.float32)
-            for fold_models in xgb_stage_a_models:
-                meta_t += predict_xgb(fold_models, X_stage_a_t) / len(xgb_stage_a_models)
-
-            # Stage B prediction — average across Stage B folds
-            X_stage_b_t = make_features(raw_embed_t, presence_t, xgb_pca, extra=meta_t)
-            xgb_test_preds = np.zeros((len(study_ids), len(TARGETS)), dtype=np.float32)
-            for fold_models in xgb_stage_b_models:
-                xgb_test_preds += predict_xgb(fold_models, X_stage_b_t) / len(xgb_stage_b_models)
-
-            final_preds = best_alpha * preds + (1 - best_alpha) * xgb_test_preds
-            print(f"  Blended NN + XGBoost predictions (alpha={best_alpha:.2f})")
-        except Exception as e:
-            print(f"[WARN] XGBoost test-time prediction failed ({e}) — using NN-only predictions.")
-            final_preds = preds
-
-    # ══ SUBMISSION ══════════════════════════════════════════════
-    sub = pd.DataFrame(final_preds, columns=TARGETS)
-    sub.insert(0, "StudyInstanceUID", study_ids)
-
-    # add any test studies with no embeddings at 0.5 (default)
-    missing = set(test_df["StudyInstanceUID"].astype(str)) - set(study_ids)
-    if missing:
-        print(f"[WARN] {len(missing)} test studies had no embeddings — defaulting to 0.5")
-        filler = pd.DataFrame([[sid] + [0.5]*len(TARGETS) for sid in missing],
-                               columns=["StudyInstanceUID"] + TARGETS)
-        sub = pd.concat([sub, filler], ignore_index=True)
-
-    # reorder to match sample submission
-    sub = sub.set_index("StudyInstanceUID").reindex(
-        test_df["StudyInstanceUID"].astype(str)).reset_index()
-    sub.columns = ["StudyInstanceUID"] + TARGETS
-
-    out = WORK_DIR / "submission.csv"
-    sub.to_csv(out, index=False)
-
-    print("\n" + "=" * 60)
-    print("DONE")
-    print("=" * 60)
-    print(f"OOF AUC    : {mean_auc:.5f}")
-    print(f"Submission : {out}")
-    print(f"Shape      : {sub.shape}")
-    print(sub.head(3).to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
