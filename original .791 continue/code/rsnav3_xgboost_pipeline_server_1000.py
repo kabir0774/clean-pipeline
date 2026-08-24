@@ -989,7 +989,23 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
+            # Never use Python ``or`` with tensors: evaluating a multi-element
+            # tensor as bool raises "Boolean value of Tensor is ambiguous".
+            candidate = getattr(feats, "pooler_output", None)
+            if candidate is None:
+                candidate = getattr(feats, "image_embeds", None)
+            if candidate is None:
+                hidden = getattr(feats, "last_hidden_state", None)
+                if hidden is not None:
+                    candidate = hidden.mean(dim=1)
+            feats = candidate
+        if feats is None or not torch.is_tensor(feats):
+            raise TypeError(f"Unsupported MedSigLIP image feature output: {type(feats)!r}")
+        if feats.ndim != 2 or feats.shape[-1] != EMBED_DIM:
+            raise ValueError(
+                f"Unexpected MedSigLIP feature shape {tuple(feats.shape)}; "
+                f"expected [N, {EMBED_DIM}]"
+            )
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
