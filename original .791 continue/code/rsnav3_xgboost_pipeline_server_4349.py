@@ -257,7 +257,7 @@ else:
         r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\DATA\output best\final_labels_real_plus_generated best.csv",
     ))
 
-N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "4340"))
+N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "4349"))
 SAMPLE_SEED     = int(os.environ.get("RSNA_SAMPLE_SEED", "42"))
 STUDY_LIST_CSV = os.environ.get("RSNA_STUDY_LIST", "").strip()
 RUN_TEST_INFERENCE = os.environ.get("RSNA_RUN_TEST_INFERENCE", "0").lower() not in {"0", "false", "no"}
@@ -1656,7 +1656,7 @@ def main():
         if "model_enc" in dir(): del model_enc
         torch.cuda.empty_cache()
 
-    # ══ STAGE A — PRETRAIN ON WEAK LABELS (all 4340: 58 real + weak) ═══
+    # ══ STAGE A — PRETRAIN ON WEAK LABELS (all 4349: 58 real + weak) ═══
     print("\n── STAGE A: Pretrain on weak labels only ──")
     labeled_ids = set(labeled["StudyInstanceUID"].astype(str))
     emb_ids     = set(train_emb_idx["StudyInstanceUID"].astype(str))
