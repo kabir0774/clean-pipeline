@@ -2013,3 +2013,5 @@ def main():
 
     print("\n── TEST: Embed ──")
     processor, model_enc, device_enc = load_medsiglip()
+     if __name__ == "__main__":
+       main()
