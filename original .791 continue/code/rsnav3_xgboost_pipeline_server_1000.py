@@ -5,7 +5,7 @@
 # Kaggle paths:
 #   Data    : /kaggle/input/rsna-knee-abnormality-2024/
 #   MedSigLIP: /kaggle/input/medsiglip/
-#   Output  : /kaggle/working
+#   Output  : /kaggle/working/
 # ============================================================
 
 import os
@@ -964,7 +964,6 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     print(f"\n── STAGE A0: Fine-tune MedSigLIP (last {train_last_blocks} blocks) "
           f"on {len(pretrain_ids)} studies ──")
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
-    model = model.float()
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
     rng = np.random.default_rng(seed)
@@ -997,12 +996,11 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             images = [images[i] for i in take]
         inputs = processor(images=images, return_tensors="pt")
         pixels = inputs["pixel_values"].to(device)
+        if device == "cuda":
+            pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-           pooled_attr = getattr(feats, "pooler_output", None)
-           if pooled_attr is None:
-            pooled_attr = getattr(feats, "image_embeds", None)
-           feats = pooled_attr
+            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
@@ -1951,6 +1949,17 @@ def main():
     if _cached_emb_idx.exists():
         print("  Found existing embedding index — skipping embed step")
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
+        # dtype=str above reads presence_mask back as the STRING "1"/"0",
+        # not the integer 1/0 that embed_slots() originally wrote. Every
+        # downstream consumer (study_pooled_embedding, StudyDataset,
+        # InferDataset) checks `presence_mask == 1` -- against a string,
+        # that comparison is always False, so every reloaded cache run
+        # would silently treat every slot as absent (all-zero pooled
+        # embeddings) without ever raising an error. Cast back to int
+        # here, once, at the source, rather than patching every
+        # comparison site.
+        train_emb_idx["presence_mask"] = pd.to_numeric(
+            train_emb_idx["presence_mask"], errors="coerce").fillna(0).astype(int)
     else:
         print("\n── TRAIN: Embed ──")
         processor, model_enc, device_enc = load_medsiglip()
@@ -2016,6 +2025,10 @@ def main():
                     if _mrnet_cached_emb_idx.exists():
                         print("  Found existing MRNet embedding index — skipping embed step")
                         mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
+                        # same presence_mask string/int fix as the main
+                        # embedding index reload above
+                        mrnet_emb_idx["presence_mask"] = pd.to_numeric(
+                            mrnet_emb_idx["presence_mask"], errors="coerce").fillna(0).astype(int)
                     else:
                         mrnet_processor, mrnet_model_enc, mrnet_device_enc = load_medsiglip()
                         mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, mrnet_processor,
