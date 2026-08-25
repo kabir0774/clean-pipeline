@@ -996,22 +996,30 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     print(f"\n── STAGE A0: Fine-tune MedSigLIP (last {train_last_blocks} blocks) "
           f"on {len(pretrain_ids)} studies ──")
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
-    model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
-    # load_medsiglip() loads the WHOLE model in fp16 on CUDA (fine for the
-    # frozen 90%+ of the backbone used only for inference elsewhere in the
-    # pipeline). But torch.amp.GradScaler requires real fp32 "master"
-    # parameters to unscale gradients into -- it cannot unscale gradients
-    # for parameters that are themselves fp16, and raises exactly that
-    # ("Attempting to unscale FP16 gradients") if you try. Since only the
-    # last few blocks + post_layernorm are actually being trained here
-    # (unfreeze_medsiglip_vision already restricted requires_grad to just
-    # those), upcast ONLY those trainable parameters to fp32 -- the frozen
-    # majority of the model stays fp16, so this costs almost no extra
-    # memory versus the alternative of upcasting the whole model.
-    for p in model.vision_model.parameters():
-        if p.requires_grad:
-            p.data = p.data.float()
+    # load_medsiglip() loads the whole model in fp16 on CUDA (correct and
+    # cheap for every OTHER stage in this pipeline, which only ever runs
+    # inference/embedding through it -- no backward pass). Stage A0 is the
+    # one place that actually backprops into this model, and mixed fp16/
+    # fp32 parameters inside a single forward graph don't work cleanly
+    # here: autocast decides op-by-op which precision to run in (e.g. it
+    # always runs layer_norm in fp32), but it does not reconcile a fp16
+    # hidden state flowing out of a frozen fp16 block into an fp32
+    # parameter in the next (unfrozen) block -- PyTorch raises rather than
+    # silently casting. Casting only the trainable tail (an earlier
+    # attempt) hits exactly that boundary and crashes with "expected
+    # scalar type Half but found Float" inside layer_norm.
+    #
+    # The robust fix is to stop mixing dtypes inside the model at all:
+    # cast the WHOLE vision tower to fp32 before training. This trades
+    # some GPU memory/speed for correctness -- an acceptable cost here
+    # since Stage A0's own docstring already treats this stage as
+    # "affordable to run at all" rather than performance-critical, and
+    # every stage AFTER this one goes back to loading the saved
+    # checkpoint via load_medsiglip() at whatever dtype it normally uses,
+    # so this cost is paid once, only during this one fine-tuning stage.
+    model = model.float()
+    model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
     rng = np.random.default_rng(seed)
     shuffled = pretrain_ids.copy()
@@ -1024,7 +1032,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
         else np.zeros(len(lbl_idx), dtype=bool)
     is_real_map = dict(zip(lbl_idx.index, is_real))
 
-    head = nn.Linear(EMBED_DIM, len(TARGETS)).to(device)  # created fresh -> already fp32
+    head = nn.Linear(EMBED_DIM, len(TARGETS)).to(device)
     trainable = [p for p in model.vision_model.parameters() if p.requires_grad] + list(head.parameters())
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
@@ -1043,8 +1051,14 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             images = [images[i] for i in take]
         inputs = processor(images=images, return_tensors="pt")
         pixels = inputs["pixel_values"].to(device)
-        if device == "cuda":
-            pixels = pixels.to(dtype=torch.float16)
+        # NOTE: no manual fp16 cast here (unlike encode_images() elsewhere
+        # in this file) -- the model going into get_image_features() below
+        # is fp32 (see model.float() near the top of
+        # finetune_medsiglip_stage_a0), so pixels should stay fp32 too.
+        # autocast (wrapping the caller of _forward_study) already decides
+        # per-op which precision to actually compute in; forcing input to
+        # fp16 here would reintroduce the same dtype-mismatch crash this
+        # fix addresses, just one layer earlier.
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
             if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
