@@ -964,6 +964,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     print(f"\n── STAGE A0: Fine-tune MedSigLIP (last {train_last_blocks} blocks) "
           f"on {len(pretrain_ids)} studies ──")
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
+    model = model.float()
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
     rng = np.random.default_rng(seed)
@@ -996,8 +997,6 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             images = [images[i] for i in take]
         inputs = processor(images=images, return_tensors="pt")
         pixels = inputs["pixel_values"].to(device)
-        if device == "cuda":
-            pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
            pooled_attr = getattr(feats, "pooler_output", None)
