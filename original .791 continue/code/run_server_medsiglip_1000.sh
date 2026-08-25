@@ -4,12 +4,12 @@ set -euo pipefail
 ROOT="/home/harleen_ece/rsna_knee_ai"
 EXP="$ROOT/original .791 continue"
 CODE_DIR="$EXP/code"
-CACHE_DIR="$EXP/cache_4349"
-OUTPUT_DIR="$EXP/outputs_4349"
+CACHE_DIR="$EXP/cache_1000"
+OUTPUT_DIR="$EXP/outputs_1000"
 LOG_DIR="$EXP/logs"
 SCRIPT="$CODE_DIR/rsnav3_xgboost_pipeline_server_1000.py"
 mkdir -p "$CODE_DIR" "$CACHE_DIR" "$OUTPUT_DIR" "$LOG_DIR"
-LOG_FILE="$LOG_DIR/train_4349_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/train_1000_$(date +%Y%m%d_%H%M%S).log"
 
 export RSNA_SERVER_ROOT="$ROOT"
 export RSNA_DATA_ROOT="$ROOT/DATA"
@@ -19,7 +19,7 @@ export RSNA_EXPERIMENT_DIR="$EXP"
 export RSNA_CACHE_DIR="$CACHE_DIR"
 export RSNA_WORK_DIR="$OUTPUT_DIR"
 
-export RSNA_N_TOTAL_STUDIES="4349"
+export RSNA_N_TOTAL_STUDIES="1000"
 export RSNA_SAMPLE_SEED="42"
 export RSNA_BATCH_SIZE="4"
 export RSNA_RUN_STAGE_A0="1"
@@ -60,7 +60,7 @@ if flag.isna().any(): raise SystemExit("is_real_label contains unsupported value
 gold=df[flag].StudyInstanceUID.nunique(); weak=df[~flag].StudyInstanceUID.nunique()
 print("Gold studies:",gold); print("Weak studies:",weak)
 if gold != 58: raise SystemExit(f"Expected exactly 58 gold studies, found {gold}")
-if weak < 4291: raise SystemExit(f"Need at least 4291 weak studies, found {weak}")
+if weak < 942: raise SystemExit(f"Need at least 942 weak studies, found {weak}")
 PY
 
 echo "Experiment: $EXP"
@@ -68,6 +68,6 @@ echo "Code:       $CODE_DIR"
 echo "Cache:      $CACHE_DIR"
 echo "Outputs:    $OUTPUT_DIR"
 echo "Live log:   $LOG_FILE"
-echo "Fresh 4349-study cache: $CACHE_DIR (the old 1000-study cache/ is not used)."
-echo "Restart the same command after an error; completed 4349 embeddings and fold checkpoints will be reused."
+echo "Fresh 1000-study cache: $CACHE_DIR (the old 4349-study cache is not used)."
+echo "Restart the same command after an error; completed 1000-study embeddings and fold checkpoints will be reused."
 python3 -u "$SCRIPT" 2>&1 | tee -a "$LOG_FILE"
