@@ -5,7 +5,7 @@
 # Kaggle paths:
 #   Data    : /kaggle/input/rsna-knee-abnormality-2024/
 #   MedSigLIP: /kaggle/input/medsiglip/
-#   Output  : /kaggle/working/
+#   Output  : /kaggle/working
 # ============================================================
 
 import os
