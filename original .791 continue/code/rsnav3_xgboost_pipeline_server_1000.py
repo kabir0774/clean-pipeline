@@ -1000,18 +1000,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-            if hasattr(feats, "pooler_output"):
-                feats = feats.pooler_output
-            elif hasattr(feats, "image_embeds"):
-                feats = feats.image_embeds
-            elif hasattr(feats, "last_hidden_state"):
-                feats = feats.last_hidden_state.mean(1)
-            else:
-                raise ValueError(
-                    "get_image_features() returned an object with none of "
-                    "pooler_output / image_embeds / last_hidden_state -- "
-                    "cannot recover a feature tensor."
-                )
+            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
