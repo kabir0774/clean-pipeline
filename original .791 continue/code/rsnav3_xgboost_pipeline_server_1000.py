@@ -966,18 +966,6 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
-    # GradScaler requires FP32 master weights for any parameter it updates --
-    # it can only unscale FP32 gradients ("Attempting to unscale FP16
-    # gradients" otherwise). load_medsiglip() loads the whole model in fp16
-    # for fast/cheap inference, which is fine for the frozen backbone, but
-    # the newly-unfrozen last N blocks (+ post_layernorm) are about to be
-    # optimized here, so upcast just those to fp32. Autocast still runs the
-    # forward pass in fp16/mixed precision for speed; only the trainable
-    # master weights need to be fp32.
-    for p in model.vision_model.parameters():
-        if p.requires_grad:
-            p.data = p.data.float()
-
     rng = np.random.default_rng(seed)
     shuffled = pretrain_ids.copy()
     rng.shuffle(shuffled)
