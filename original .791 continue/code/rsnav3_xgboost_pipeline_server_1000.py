@@ -998,6 +998,21 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
+    # load_medsiglip() loads the WHOLE model in fp16 on CUDA (fine for the
+    # frozen 90%+ of the backbone used only for inference elsewhere in the
+    # pipeline). But torch.amp.GradScaler requires real fp32 "master"
+    # parameters to unscale gradients into -- it cannot unscale gradients
+    # for parameters that are themselves fp16, and raises exactly that
+    # ("Attempting to unscale FP16 gradients") if you try. Since only the
+    # last few blocks + post_layernorm are actually being trained here
+    # (unfreeze_medsiglip_vision already restricted requires_grad to just
+    # those), upcast ONLY those trainable parameters to fp32 -- the frozen
+    # majority of the model stays fp16, so this costs almost no extra
+    # memory versus the alternative of upcasting the whole model.
+    for p in model.vision_model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+
     rng = np.random.default_rng(seed)
     shuffled = pretrain_ids.copy()
     rng.shuffle(shuffled)
@@ -1009,7 +1024,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
         else np.zeros(len(lbl_idx), dtype=bool)
     is_real_map = dict(zip(lbl_idx.index, is_real))
 
-    head = nn.Linear(EMBED_DIM, len(TARGETS)).to(device)
+    head = nn.Linear(EMBED_DIM, len(TARGETS)).to(device)  # created fresh -> already fp32
     trainable = [p for p in model.vision_model.parameters() if p.requires_grad] + list(head.parameters())
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
