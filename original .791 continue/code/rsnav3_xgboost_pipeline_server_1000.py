@@ -996,29 +996,6 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     print(f"\n── STAGE A0: Fine-tune MedSigLIP (last {train_last_blocks} blocks) "
           f"on {len(pretrain_ids)} studies ──")
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
-
-    # load_medsiglip() loads the whole model in fp16 on CUDA (correct and
-    # cheap for every OTHER stage in this pipeline, which only ever runs
-    # inference/embedding through it -- no backward pass). Stage A0 is the
-    # one place that actually backprops into this model, and mixed fp16/
-    # fp32 parameters inside a single forward graph don't work cleanly
-    # here: autocast decides op-by-op which precision to run in (e.g. it
-    # always runs layer_norm in fp32), but it does not reconcile a fp16
-    # hidden state flowing out of a frozen fp16 block into an fp32
-    # parameter in the next (unfrozen) block -- PyTorch raises rather than
-    # silently casting. Casting only the trainable tail (an earlier
-    # attempt) hits exactly that boundary and crashes with "expected
-    # scalar type Half but found Float" inside layer_norm.
-    #
-    # The robust fix is to stop mixing dtypes inside the model at all:
-    # cast the WHOLE vision tower to fp32 before training. This trades
-    # some GPU memory/speed for correctness -- an acceptable cost here
-    # since Stage A0's own docstring already treats this stage as
-    # "affordable to run at all" rather than performance-critical, and
-    # every stage AFTER this one goes back to loading the saved
-    # checkpoint via load_medsiglip() at whatever dtype it normally uses,
-    # so this cost is paid once, only during this one fine-tuning stage.
-    model = model.float()
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
     rng = np.random.default_rng(seed)
@@ -1051,25 +1028,11 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             images = [images[i] for i in take]
         inputs = processor(images=images, return_tensors="pt")
         pixels = inputs["pixel_values"].to(device)
-        # NOTE: no manual fp16 cast here (unlike encode_images() elsewhere
-        # in this file) -- the model going into get_image_features() below
-        # is fp32 (see model.float() near the top of
-        # finetune_medsiglip_stage_a0), so pixels should stay fp32 too.
-        # autocast (wrapping the caller of _forward_study) already decides
-        # per-op which precision to actually compute in; forcing input to
-        # fp16 here would reintroduce the same dtype-mismatch crash this
-        # fix addresses, just one layer earlier.
+        if device == "cuda":
+            pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-            if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
-                feats = feats.pooler_output
-            elif hasattr(feats, "image_embeds") and feats.image_embeds is not None:
-                feats = feats.image_embeds
-            else:
-                raise ValueError(
-                    "get_image_features() returned an object with neither "
-                    "pooler_output nor image_embeds set — cannot extract features."
-                )
+            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
@@ -2040,17 +2003,6 @@ def main():
     if _cached_emb_idx.exists():
         print("  Found existing embedding index — skipping embed step")
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
-        # dtype=str above reads presence_mask back as the STRING "1"/"0",
-        # not the integer 1/0 that embed_slots() originally wrote. Every
-        # downstream consumer (study_pooled_embedding, StudyDataset,
-        # InferDataset) checks `presence_mask == 1` -- against a string,
-        # that comparison is always False, so every reloaded cache run
-        # would silently treat every slot as absent (all-zero pooled
-        # embeddings) without ever raising an error. Cast back to int
-        # here, once, at the source, rather than patching every
-        # comparison site.
-        train_emb_idx["presence_mask"] = pd.to_numeric(
-            train_emb_idx["presence_mask"], errors="coerce").fillna(0).astype(int)
     else:
         print("\n── TRAIN: Embed ──")
         processor, model_enc, device_enc = load_medsiglip()
@@ -2116,10 +2068,6 @@ def main():
                     if _mrnet_cached_emb_idx.exists():
                         print("  Found existing MRNet embedding index — skipping embed step")
                         mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
-                        # same presence_mask string/int fix as the main
-                        # embedding index reload above
-                        mrnet_emb_idx["presence_mask"] = pd.to_numeric(
-                            mrnet_emb_idx["presence_mask"], errors="coerce").fillna(0).astype(int)
                     else:
                         mrnet_processor, mrnet_model_enc, mrnet_device_enc = load_medsiglip()
                         mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, mrnet_processor,
