@@ -5,7 +5,7 @@
 # Kaggle paths:
 #   Data    : /kaggle/input/rsna-knee-abnormality-2024/
 #   MedSigLIP: /kaggle/input/medsiglip/
-#   Output  : /kaggle/working
+#   Output  : /kaggle/working/
 # ============================================================
 
 import os
@@ -1000,10 +1000,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-           pooled_attr = getattr(feats, "pooler_output", None)
-           if pooled_attr is None:
-            pooled_attr = getattr(feats, "image_embeds", None)
-           feats = pooled_attr
+            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
