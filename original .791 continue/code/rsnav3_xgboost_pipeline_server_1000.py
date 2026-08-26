@@ -1938,6 +1938,43 @@ def main():
     _cached_emb_idx = WORK_DIR / f"train_embedding_index_{_study_set_tag}.csv"
     _cached_slots   = WORK_DIR / f"train_slots_cache_{_study_set_tag}.pkl"
 
+    # POOL FRESHNESS: medsiglip_finetuned_vision.pt / stage_a_pretrained.pt /
+    # fold_*.pt / xgb_*.pkl / oof_predictions.csv are all fit against a
+    # *specific* training pool (N_TOTAL_STUDIES + SAMPLE_SEED). Unlike the
+    # DICOM/slots/embedding-index caches above, these checkpoints still use
+    # fixed filenames with no pool tag -- so re-running with a different
+    # N_TOTAL_STUDIES (e.g. 1000 -> 4349) silently kept "skipping" Stage
+    # A0/A/B and reusing checkpoints trained on the OLD, smaller pool, even
+    # though the run banner correctly reported the new pool size.
+    # check_embedding_cache_freshness() below only guards against the
+    # *encoder* changing (mtime/size of medsiglip_finetuned_vision.pt) --
+    # it can't catch this, since the encoder file itself doesn't change
+    # when Stage A0 was skipped. Guard separately here by stamping the pool
+    # tag next to the checkpoints and wiping them if it doesn't match.
+    _pool_sig_path = MODEL_DIR / "training_pool_signature.txt"
+    _prev_pool_tag = _pool_sig_path.read_text().strip() if _pool_sig_path.exists() else None
+    if _prev_pool_tag != _study_set_tag:
+        _pool_stale = [
+            MODEL_DIR / "medsiglip_finetuned_vision.pt",
+            MODEL_DIR / "stage_a_pretrained.pt",
+            MODEL_DIR / "xgb_stage_a.pkl",
+            MODEL_DIR / "oof_predictions.csv",
+        ]
+        _pool_stale.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
+        _pool_stale.extend(MODEL_DIR.glob("fold_*.pt"))
+        _pool_stale.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
+        _pool_removed = []
+        for _sp in sorted(set(_pool_stale), key=lambda p: str(p)):
+            if _sp.exists():
+                _sp.unlink()
+                _pool_removed.append(_sp.name)
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        _pool_sig_path.write_text(_study_set_tag)
+        if _pool_removed:
+            print(f"  [CACHE] Training pool changed ({_prev_pool_tag or 'unrecorded/legacy'} -> "
+                  f"{_study_set_tag}) — invalidated {len(_pool_removed)} pool-dependent "
+                  f"checkpoint(s): {_pool_removed}")
+
     if FORCE_RESCAN:
         print("  RSNA_FORCE_RESCAN=1 — deleting cached DICOM index / slots / "
               "embedding index, rebuilding from scratch this run")
