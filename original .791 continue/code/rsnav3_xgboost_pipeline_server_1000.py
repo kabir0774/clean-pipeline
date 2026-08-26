@@ -1067,7 +1067,8 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
                 study = str(study)
                 if study not in lbl_idx.index:
                     continue
-                logits = _forward_study(study)
+                with torch.amp.autocast("cuda", enabled=device == "cuda"):
+                    logits = _forward_study(study)
                 if logits is None:
                     continue
                 P.append(torch.sigmoid(logits).cpu().numpy())
@@ -2479,4 +2480,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
