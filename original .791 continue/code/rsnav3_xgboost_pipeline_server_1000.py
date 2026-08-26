@@ -329,6 +329,15 @@ MEDSIGLIP_FINETUNE_BLOCKS = int(os.environ.get("RSNA_STAGE_A0_BLOCKS", "4"))
 MEDSIGLIP_FINETUNE_EPOCHS = int(os.environ.get("RSNA_STAGE_A0_EPOCHS", "3"))
 MEDSIGLIP_FINETUNE_MAX_IMAGES = int(os.environ.get("RSNA_STAGE_A0_MAX_IMAGES", "12"))
 
+# Set RSNA_FORCE_RESCAN=1 to ignore/delete the train-side DICOM index,
+# slots, and embedding-index caches at startup and rebuild them from
+# scratch this run (e.g. after changing N_TOTAL_STUDIES / the study
+# sample, or when you don't trust a cache is still valid). Does NOT
+# touch the fine-tuned MedSigLIP checkpoint or per-study embedding
+# .npy files themselves -- only the three index/cache files that
+# gate whether scan/slot/embed steps are skipped.
+FORCE_RESCAN = os.environ.get("RSNA_FORCE_RESCAN", "0").lower() not in {"0", "false", "no"}
+
 SLOT_PRIOR = {
     "ACL":              [1, 0, 0, 1, 0, 1],
     "MCL":              [0, 1, 0, 0, 1, 0],
@@ -966,6 +975,18 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
     model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
 
+    # GradScaler requires FP32 master weights for any parameter it updates --
+    # it can only unscale FP32 gradients ("Attempting to unscale FP16
+    # gradients" otherwise). load_medsiglip() loads the whole model in fp16
+    # for fast/cheap inference, which is fine for the frozen backbone, but
+    # the newly-unfrozen last N blocks (+ post_layernorm) are about to be
+    # optimized here, so upcast just those to fp32. Autocast still runs the
+    # forward pass in fp16/mixed precision for speed; only the trainable
+    # master weights need to be fp32.
+    for p in model.vision_model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+
     rng = np.random.default_rng(seed)
     shuffled = pretrain_ids.copy()
     rng.shuffle(shuffled)
@@ -1000,7 +1021,18 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
+            if hasattr(feats, "pooler_output"):
+                feats = feats.pooler_output
+            elif hasattr(feats, "image_embeds"):
+                feats = feats.image_embeds
+            elif hasattr(feats, "last_hidden_state"):
+                feats = feats.last_hidden_state.mean(1)
+            else:
+                raise ValueError(
+                    "get_image_features() returned an object with none of "
+                    "pooler_output / image_embeds / last_hidden_state -- "
+                    "cannot recover a feature tensor."
+                )
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
@@ -1896,6 +1928,14 @@ def main():
     _cached_emb_idx = WORK_DIR / "train_embedding_index.csv"
     _cached_slots   = WORK_DIR / "train_slots_cache.pkl"
 
+    if FORCE_RESCAN:
+        print("  RSNA_FORCE_RESCAN=1 — deleting cached DICOM index / slots / "
+              "embedding index, rebuilding from scratch this run")
+        for _f in (_cached_dcm_idx, _cached_slots, _cached_emb_idx):
+            if _f.exists():
+                _f.unlink()
+                print(f"    removed {_f}")
+
     # DICOM index + slot assignment are needed both for embedding AND for
     # Stage A0 MedSigLIP fine-tuning below (which reads raw pixels directly,
     # bypassing any cached embeddings) -- so these load/compute
@@ -2439,3 +2479,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
