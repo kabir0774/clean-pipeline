@@ -1925,9 +1925,18 @@ def main():
         ensure_studies_unzipped(labeled["StudyInstanceUID"], TRAIN_SERIES, TRAIN_SERIES_ZIP)
 
     print("\n── TRAIN: Scan DICOMs ──")
-    _cached_dcm_idx = WORK_DIR / "train_dicom_index.csv"
-    _cached_emb_idx = WORK_DIR / "train_embedding_index.csv"
-    _cached_slots   = WORK_DIR / "train_slots_cache.pkl"
+    # Cache filenames are fingerprinted by the actual study selection
+    # (N_TOTAL_STUDIES, plus the study-list CSV path if one is set) so that
+    # changing RSNA_N_TOTAL_STUDIES (e.g. 1000 -> 4349) gets its own fresh
+    # cache set instead of silently reusing train_dicom_index.csv /
+    # train_slots_cache.pkl / train_embedding_index.csv left over from a
+    # prior run with a different study count under the same fixed filename.
+    _study_set_tag = f"n{N_TOTAL_STUDIES}"
+    if STUDY_LIST_CSV:
+        _study_set_tag += "_" + Path(STUDY_LIST_CSV).stem
+    _cached_dcm_idx = WORK_DIR / f"train_dicom_index_{_study_set_tag}.csv"
+    _cached_emb_idx = WORK_DIR / f"train_embedding_index_{_study_set_tag}.csv"
+    _cached_slots   = WORK_DIR / f"train_slots_cache_{_study_set_tag}.pkl"
 
     if FORCE_RESCAN:
         print("  RSNA_FORCE_RESCAN=1 — deleting cached DICOM index / slots / "
