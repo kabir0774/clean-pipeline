@@ -276,7 +276,7 @@ else:
         r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\DATA\output best\final_labels_real_plus_generated best.csv",
     ))
 
-N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "4340"))
+N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "1000"))
 SAMPLE_SEED     = int(os.environ.get("RSNA_SAMPLE_SEED", "42"))
 STUDY_LIST_CSV = os.environ.get("RSNA_STUDY_LIST", "").strip()
 RUN_TEST_INFERENCE = os.environ.get("RSNA_RUN_TEST_INFERENCE", "1").lower() not in {"0", "false", "no"}
