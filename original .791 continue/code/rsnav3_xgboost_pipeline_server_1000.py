@@ -5,16 +5,14 @@
 # Kaggle paths:
 #   Data    : /kaggle/input/rsna-knee-abnormality-2024/
 #   MedSigLIP: /kaggle/input/medsiglip/
-#   Output  : /kaggle/working/
+#   Output  : /kaggle/working
 # ============================================================
 
 import os
 import re
-import json
 import math
 import random
 import pickle
-import hashlib
 import argparse
 import subprocess
 from pathlib import Path
@@ -278,7 +276,7 @@ else:
         r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\DATA\output best\final_labels_real_plus_generated best.csv",
     ))
 
-N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "1000"))
+N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "4340"))
 SAMPLE_SEED     = int(os.environ.get("RSNA_SAMPLE_SEED", "42"))
 STUDY_LIST_CSV = os.environ.get("RSNA_STUDY_LIST", "").strip()
 RUN_TEST_INFERENCE = os.environ.get("RSNA_RUN_TEST_INFERENCE", "1").lower() not in {"0", "false", "no"}
@@ -442,36 +440,6 @@ def ensure_studies_unzipped(study_ids, series_root, zip_path):
     if still_missing:
         print(f"  [WARN] {len(still_missing)} studies not found in zip either: "
               f"{sorted(still_missing)[:5]}{'...' if len(still_missing) > 5 else ''}")
-
-
-def study_set_fingerprint(study_ids):
-    """
-    Stable fingerprint of a set of StudyInstanceUIDs. Caches (DICOM index,
-    slots) are only reused when this fingerprint matches what they were
-    built from -- i.e. the exact same set of studies. Any change to the
-    training pool (more studies, fewer, or just a different sample at the
-    same count) produces a different fingerprint and forces a rebuild, so
-    a size change (e.g. 1000 -> 4000) can never silently reuse a stale
-    cache built for a different pool.
-    """
-    ids = sorted(str(s) for s in study_ids)
-    digest = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
-    return digest, len(ids)
-
-
-def load_cache_meta(meta_path):
-    if meta_path.exists():
-        try:
-            with open(meta_path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def save_cache_meta(meta_path, fingerprint, n_studies):
-    with open(meta_path, "w") as f:
-        json.dump({"study_fingerprint": fingerprint, "n_studies": n_studies}, f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1032,7 +1000,10 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
             pixels = pixels.to(dtype=torch.float16)
         feats = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(feats):
-            feats = getattr(feats, "pooler_output", None) or getattr(feats, "image_embeds", None)
+           pooled_attr = getattr(feats, "pooler_output", None)
+           if pooled_attr is None:
+            pooled_attr = getattr(feats, "image_embeds", None)
+           feats = pooled_attr
         pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
         return head(pooled).squeeze(0)  # [N_TARGETS]
 
@@ -1927,7 +1898,6 @@ def main():
     _cached_dcm_idx = WORK_DIR / "train_dicom_index.csv"
     _cached_emb_idx = WORK_DIR / "train_embedding_index.csv"
     _cached_slots   = WORK_DIR / "train_slots_cache.pkl"
-    _cache_meta_path = WORK_DIR / "train_cache_meta.json"
 
     # DICOM index + slot assignment are needed both for embedding AND for
     # Stage A0 MedSigLIP fine-tuning below (which reads raw pixels directly,
@@ -1938,36 +1908,16 @@ def main():
     # when embeddings did NOT already exist -- fine before Stage A0 existed,
     # but Stage A0 needs raw DICOM access even on a machine that already has
     # cached embeddings from a prior stock-encoder run.
-    #
-    # Cache validity is keyed on a fingerprint of the *exact set* of studies
-    # in the current training pool, not just on "does the file exist". That
-    # way: same study pool (e.g. rerunning with the same N_TOTAL_STUDIES and
-    # SAMPLE_SEED) -> reuse cache as before. Different pool (N_TOTAL_STUDIES
-    # raised from 1000 to 4000, seed changed, label file changed, etc.) ->
-    # fingerprint mismatches and both caches are rebuilt from scratch, so a
-    # smaller/older pool's cache can never be silently reused for a larger run.
-    _study_ids_now = set(labeled["StudyInstanceUID"].astype(str).tolist())
-    _fp_now, _n_now = study_set_fingerprint(_study_ids_now)
-    _cache_meta = load_cache_meta(_cache_meta_path)
-    _cache_valid = (
-        _cache_meta is not None
-        and _cache_meta.get("study_fingerprint") == _fp_now
-        and _cached_dcm_idx.exists()
-        and _cached_slots.exists()
-    )
-    if _cache_meta is not None and not _cache_valid:
-        print(f"  [CACHE] Study pool changed ({_cache_meta.get('n_studies', '?')} -> {_n_now} studies) "
-              f"— rebuilding DICOM index + slots from scratch")
-
-    if _cache_valid:
-        print(f"  Reusing cached DICOM index: {_cached_dcm_idx}  (study pool unchanged: {_n_now} studies)")
+    if _cached_dcm_idx.exists():
+        print(f"  Reusing cached DICOM index: {_cached_dcm_idx}")
         train_dcm = pd.read_csv(_cached_dcm_idx, dtype=str)
     else:
-        train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=_study_ids_now)
+        train_study_filter = set(labeled["StudyInstanceUID"].astype(str).tolist())
+        train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=train_study_filter)
         train_dcm.to_csv(_cached_dcm_idx, index=False)
 
     print("\n── TRAIN: Build slots ──")
-    if _cache_valid:
+    if _cached_slots.exists():
         print(f"  Reusing cached slots: {_cached_slots}")
         with open(_cached_slots, "rb") as f:
             train_slots, train_lat = pickle.load(f)
@@ -1978,7 +1928,6 @@ def main():
         with open(_cached_slots, "wb") as f:
             pickle.dump((train_slots, train_lat), f)
         print(f"  Cached slots to: {_cached_slots}")
-        save_cache_meta(_cache_meta_path, _fp_now, _n_now)
 
     # ══ STAGE A0 — FINE-TUNE MEDSIGLIP ITSELF (run once; the checkpoint it
     # saves makes MedSigLIP a fixed, better-adapted function again, so every
