@@ -768,11 +768,18 @@ def check_embedding_cache_freshness(work_dir):
         removed.append(f"embeddings/ ({n_embedding_files} files)")
 
     stale_files = [
-        work_dir / "train_embedding_index.csv",
         MODEL_DIR / "stage_a_pretrained.pt",
         MODEL_DIR / "xgb_stage_a.pkl",
         MODEL_DIR / "oof_predictions.csv",
     ]
+    # Match every embedding-index variant, not just the legacy untagged
+    # name -- train_embedding_index_n1000.csv, _n4349.csv, etc. (see
+    # _study_set_tag) all list presence_mask=1 pointing at the .pt files
+    # just deleted above. Missing one here leaves a stale index that still
+    # claims files exist after they were just wiped, causing a flood of
+    # "[Errno 2] No such file or directory" the moment presence_mask is
+    # read correctly (it silently never surfaced before that was fixed).
+    stale_files.extend(work_dir.glob("train_embedding_index*.csv"))
     stale_files.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
     stale_files.extend(MODEL_DIR.glob("fold_*.pt"))
     stale_files.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
