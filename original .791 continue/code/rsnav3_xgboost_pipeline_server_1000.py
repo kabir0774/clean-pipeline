@@ -147,32 +147,6 @@ MRNET_EMB_DIR.mkdir(parents=True, exist_ok=True)
 # the way our own DICOM slot system does -- best-effort correspondence only
 MRNET_PLANE_TO_SLOT = {"sagittal": "SAG_T1", "coronal": "COR_T1", "axial": "AX_FLUID_FS"}
 
-# ── KneeMRI (Rijeka) -- second, independent, optional ACL pretraining
-# source alongside MRNet. 917 exams, single sagittal-T1 series each,
-# metadata.csv with columns examId/seriesNo/aclDiagnosis/kneeLR/roi*/
-# volumeFilename. aclDiagnosis is 0=healthy, 1=partial tear, 2=complete
-# rupture -- collapsed to binary (0 vs {1,2}) to match the same ACL
-# present/absent target MRNet already trains. Each exam is one .pck file
-# (pickled uint16 numpy array, shape [n_slices, 320, 320], intensity
-# range roughly 0-2356) referenced by volumeFilename, found by scanning
-# the vol01..vol08 subfolders. Does not require MRNet to be present, and
-# MRNet does not require this -- both can be used in the same run if
-# both happen to exist, or either alone, or neither.
-if IS_SERVER:
-    KNEEMRI_ROOT = SERVER_ROOT / "KneeMRI" / "extracted"
-elif IS_KAGGLE:
-    KNEEMRI_ROOT = Path("/kaggle/input/kneemridataset")  # only used if this dataset is attached
-else:
-    KNEEMRI_ROOT = Path(os.environ.get("RSNA_KNEEMRI_ROOT", r"C:\kabir\RSNA_Knee_AI\KneeMRI\extracted"))
-RUN_KNEEMRI_PRETRAIN = (os.environ.get("RSNA_RUN_KNEEMRI_PRETRAIN", "auto").lower() != "0"
-                        and KNEEMRI_ROOT.exists())
-KNEEMRI_EMB_DIR = WORK_DIR / "kneemri_embeddings"
-KNEEMRI_EMB_DIR.mkdir(parents=True, exist_ok=True)
-# KneeMRI is sagittal-only (no coronal/axial series), so it only ever
-# populates one slot -- matches the plane MRNet also maps to SAG_T1, so
-# both sources land on the same slot when combined.
-KNEEMRI_SLOT = "SAG_T1"
-
 def _kaggle_dataset_variants(slug):
     """
     Kaggle sometimes mounts an attached dataset at /kaggle/input/<slug>
@@ -363,6 +337,67 @@ MEDSIGLIP_FINETUNE_MAX_IMAGES = int(os.environ.get("RSNA_STAGE_A0_MAX_IMAGES", "
 # .npy files themselves -- only the three index/cache files that
 # gate whether scan/slot/embed steps are skipped.
 FORCE_RESCAN = os.environ.get("RSNA_FORCE_RESCAN", "0").lower() not in {"0", "false", "no"}
+
+# ── 2.5D slice channels ───────────────────────────────────────────────────────
+# "2d"   : each slice replicated to R=G=B (previous behaviour, exactly).
+# "2.5d" : channels are (prev, current, next) physical neighbours, giving the
+#          encoder through-plane context for free -- no architecture change,
+#          no extra forward passes, same slice count.
+#
+# WARNING: switching this invalidates every cached embedding, because the
+# encoder input itself changes. The mode is folded into the cache tag below so
+# each mode keeps its own embedding set instead of silently reusing the other's.
+#
+# Risk worth knowing: MedSigLIP is a SigLIP ViT trained largely on medical
+# images where R=G=B. Genuinely different per-channel values are somewhat
+# out-of-distribution for it -- this may add real information or may break a
+# learned assumption. A/B it on one fold before committing to a full re-embed.
+SLICE_MODE = os.environ.get("RSNA_SLICE_MODE", "2d").lower().replace("_", ".")
+if SLICE_MODE not in {"2d", "2.5d"}:
+    raise ValueError(f"RSNA_SLICE_MODE must be '2d' or '2.5d', got {SLICE_MODE!r}")
+
+# ── Sequence model over slices ────────────────────────────────────────────────
+# "none" : attention pooling only (previous behaviour, exactly).
+# "gru"  : a bidirectional GRU runs over each slot's slice sequence before
+#          attention scores are computed, so the model can use slice ORDER
+#          ("two adjacent slices both show this" vs "one isolated slice").
+#
+# Cheap to test: operates on cached embeddings, so enabling it does NOT
+# require re-embedding. Only the NN checkpoints are invalidated.
+SEQ_MODEL  = os.environ.get("RSNA_SEQ_MODEL", "none").lower()
+if SEQ_MODEL not in {"none", "gru"}:
+    raise ValueError(f"RSNA_SEQ_MODEL must be 'none' or 'gru', got {SEQ_MODEL!r}")
+SEQ_HIDDEN = int(os.environ.get("RSNA_SEQ_HIDDEN", "128"))
+
+# Stage A0 (MedSigLIP fine-tuning) is the single most expensive step in the
+# pipeline -- hours, versus minutes for everything downstream. Changing
+# SLICE_MODE legitimately invalidates it, because the encoder was fine-tuned on
+# a different input representation than it would now be asked to embed.
+#
+# Set RSNA_KEEP_ENCODER=1 to override that and reuse the existing fine-tuned
+# encoder anyway. The trade-off is real but bounded: the encoder stays adapted
+# to knee MRI (which is most of the value it provides) while being slightly
+# mismatched to the new channel layout. Worth it when the alternative is
+# spending hours re-running Stage A0 just to test a downstream change.
+KEEP_FINETUNED_ENCODER = os.environ.get("RSNA_KEEP_ENCODER", "0").lower() not in {"0", "false", "no"}
+
+# ── Slice-position embedding ──────────────────────────────────────────────────
+# Attention scoring is order-agnostic: it scores each slice independently, so
+# slice 3 and slice 40 of the same series are interchangeable to it. A learned
+# position embedding restores that information, letting the model use WHERE in
+# the stack a slice sits (mid-stack slices carry most knee anatomy; the outer
+# ends are mostly padding/edge tissue) and giving the attention layer a basis
+# for "two ADJACENT slices both fire" vs "one isolated slice".
+#
+# Indexed by NORMALIZED position within each slot's own run, not raw index:
+# series have different slice counts, so raw index 5 means something different
+# in a 10-slice series than in a 40-slice one, while normalized 0.5 is
+# mid-stack in both.
+#
+# Cheap: operates on cached embeddings, so no re-embedding and no Stage A0
+# re-run. Only the NN checkpoints are invalidated.
+POS_EMB  = os.environ.get("RSNA_POS_EMB", "0").lower() not in {"0", "false", "no"}
+POS_BINS = int(os.environ.get("RSNA_POS_BINS", "32"))
 
 SLOT_PRIOR = {
     "ACL":              [1, 0, 0, 1, 0, 1],
@@ -681,6 +716,79 @@ def dicom_to_pil(path):
     return Image.fromarray(arr).convert("RGB")
 
 
+def dicom_to_pil_gray(path):
+    """Identical decode to dicom_to_pil(), but returns a single-channel 'L'
+    image instead of a 3-channel RGB one.
+
+    Exists so build_slice_images() can compose channels itself. dicom_to_pil()
+    is deliberately left unchanged (still RGB) because other call sites depend
+    on its current contract.
+    """
+    ds  = pydicom.dcmread(str(path))
+    arr = ds.pixel_array.astype(np.float32)
+    if str(getattr(ds, "PhotometricInterpretation", "")).strip() == "MONOCHROME1":
+        arr = arr.max() - arr
+    slope     = float(getattr(ds, "RescaleSlope",     1.0) or 1.0)
+    intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
+    arr = arr * slope + intercept
+    lo, hi = np.percentile(arr, [1, 99])
+    if hi <= lo: lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo: arr = np.zeros_like(arr, dtype=np.uint8)
+    else:
+        arr = np.clip((arr - lo) / (hi - lo), 0, 1)
+        arr = (arr * 255).astype(np.uint8)
+    return Image.fromarray(arr)  # mode 'L'
+
+
+def build_slice_images(paths):
+    """Decode an ordered list of DICOM paths into encoder-ready RGB images.
+
+    SLICE_MODE == "2d"   : each slice replicated across R/G/B.
+                           Byte-identical to the previous dicom_to_pil() path.
+    SLICE_MODE == "2.5d" : channels are (previous, current, next) physical
+                           neighbours, so each encoded image carries
+                           through-plane context. Boundary slices replicate
+                           their nearest valid neighbour rather than padding
+                           with black, which would inject a fake edge.
+
+    `paths` MUST already be physically ordered (sort_slices) — 2.5D is only
+    meaningful if index i-1/i+1 are true anatomical neighbours. Slices that
+    fail to decode are dropped, and neighbours are taken from the surviving
+    list, so a mid-series decode failure shifts context by one slice rather
+    than aborting the series.
+
+    Note: neighbours come from the already-band-selected list, so when
+    select_band() decimates a long series, "previous" may be several physical
+    slices away. This is intentional (keeps slice count and memory identical to
+    2D mode) but means 2.5D context is coarser on long series.
+    """
+    grays = []
+    for p in paths:
+        try:
+            grays.append(dicom_to_pil_gray(p))
+        except Exception:
+            pass
+    if not grays:
+        return []
+
+    if SLICE_MODE != "2.5d":
+        return [g.convert("RGB") for g in grays]
+
+    # All slices in a series should share dimensions; if one doesn't, resize it
+    # to the modal size rather than crashing the whole series on Image.merge.
+    ref_size = grays[len(grays) // 2].size
+    grays = [g if g.size == ref_size else g.resize(ref_size, Image.BILINEAR)
+             for g in grays]
+
+    n = len(grays)
+    out = []
+    for i in range(n):
+        prev_img = grays[i - 1] if i > 0     else grays[i]
+        next_img = grays[i + 1] if i < n - 1 else grays[i]
+        out.append(Image.merge("RGB", (prev_img, grays[i], next_img)))
+    return out
+
+
 def unfreeze_medsiglip_vision(model, train_last_blocks=4):
     """Lock every MedSigLIP parameter, then deliberately re-unlock only the
     last N vision-tower blocks (plus the final norm layer).
@@ -794,11 +902,18 @@ def check_embedding_cache_freshness(work_dir):
         removed.append(f"embeddings/ ({n_embedding_files} files)")
 
     stale_files = [
-        work_dir / "train_embedding_index.csv",
         MODEL_DIR / "stage_a_pretrained.pt",
         MODEL_DIR / "xgb_stage_a.pkl",
         MODEL_DIR / "oof_predictions.csv",
     ]
+    # Match every embedding-index variant, not just the legacy untagged
+    # name -- train_embedding_index_n1000.csv, _n4349.csv, etc. (see
+    # _study_set_tag) all list presence_mask=1 pointing at the .pt files
+    # just deleted above. Missing one here leaves a stale index that still
+    # claims files exist after they were just wiped, causing a flood of
+    # "[Errno 2] No such file or directory" the moment presence_mask is
+    # read correctly (it silently never surfaced before that was fixed).
+    stale_files.extend(work_dir.glob("train_embedding_index*.csv"))
     stale_files.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
     stale_files.extend(MODEL_DIR.glob("fold_*.pt"))
     stale_files.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
@@ -909,10 +1024,9 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
         paths = sort_slices(paths)
         paths = select_band(paths)
 
-        images = []
-        for p in paths:
-            try: images.append(dicom_to_pil(p))
-            except Exception: pass
+        # 2D or 2.5D depending on SLICE_MODE; sort_slices() above guarantees
+        # the physical ordering that makes neighbour-stacking meaningful.
+        images = build_slice_images(paths)
 
         if not images:
             failed += 1
@@ -964,12 +1078,11 @@ def _study_images_for_finetune(study, train_slots, train_dcm, lat_map):
         plane = str(row.get("Anatomical_Plane", "Unknown"))
         paths = [Path(p) for p in series_to_files.get(series, []) if Path(p).is_file()]
         paths = select_band(sort_slices(paths))
-        slot_imgs = []
-        for p in paths:
-            try:
-                slot_imgs.append(dicom_to_pil(p))
-            except Exception:
-                pass
+        # Same builder as embed_slots(), so Stage A0 fine-tunes the encoder on
+        # exactly the representation it will later be asked to embed. If these
+        # two diverged (e.g. fine-tune on 2D, embed on 2.5D) the encoder would
+        # be adapted to inputs it never actually sees at embedding time.
+        slot_imgs = build_slice_images(paths)
         images.extend(normalise_laterality(slot_imgs, plane, lat))
     return images
 
@@ -1121,6 +1234,24 @@ class SlotAttentionModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.15),
         )
+        # Optional sequence model over the slice dimension. Attention pooling
+        # alone is order-agnostic: it scores each slice independently, so it
+        # cannot express "these two ADJACENT slices both show it, so it's real"
+        # versus "one isolated slice, probably noise". A bi-GRU over the
+        # physically-ordered slices supplies that. Built only when enabled, so
+        # SEQ_MODEL="none" leaves the parameter set byte-identical to before.
+        self.seq_model = SEQ_MODEL
+        if SEQ_MODEL == "gru":
+            self.gru = nn.GRU(PROJ_DIM, SEQ_HIDDEN, num_layers=1,
+                              batch_first=True, bidirectional=True)
+            self.gru_out = nn.Linear(SEQ_HIDDEN * 2, PROJ_DIM)
+            self.gru_norm = nn.LayerNorm(PROJ_DIM)
+        # Learned slice-position embedding (see POS_EMB above). Small init
+        # (0.02) so an untrained embedding perturbs the projected features
+        # only slightly rather than swamping them.
+        self.use_pos_emb = POS_EMB
+        if POS_EMB:
+            self.pos_emb = nn.Parameter(torch.randn(POS_BINS, PROJ_DIM) * 0.02)
         self.att   = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(PROJ_DIM), nn.Linear(PROJ_DIM, 64),
@@ -1133,8 +1264,78 @@ class SlotAttentionModel(nn.Module):
                 prior[t, s] = val * PRIOR_STRENGTH
         self.register_buffer("slot_prior", prior)
 
+    def _run_sequence(self, h, slot_indices):
+        """Run the GRU independently over each slot's contiguous slice run.
+
+        x (and therefore h) is the concatenation of every slot's slices --
+        e.g. 12 sagittal, then 12 coronal, then 12 axial. Running one GRU
+        across that whole sequence would model a "transition" from the last
+        sagittal slice to the first coronal slice, which is not a physical
+        neighbour relationship at all. Slice order WITHIN a slot is
+        meaningful (sort_slices guaranteed it); order ACROSS slots is not.
+
+        Residual (h + projected GRU output) so an unhelpful or untrained GRU
+        degrades toward the identity rather than destroying the projected
+        features -- enabling this can fail to help, but cannot catastrophically
+        break an otherwise working model.
+        """
+        out = h.clone()
+        # Contiguous runs of equal slot index. StudyDataset.get() builds
+        # slot_indices by extending per slot, so runs are already contiguous;
+        # this scan does not assume that, only that equal-and-adjacent
+        # indices belong together.
+        n = h.shape[0]
+        start = 0
+        for i in range(1, n + 1):
+            if i == n or slot_indices[i] != slot_indices[start]:
+                seg = h[start:i].unsqueeze(0)          # [1, seg_len, PROJ_DIM]
+                seg_out, _ = self.gru(seg)             # [1, seg_len, 2*SEQ_HIDDEN]
+                out[start:i] = h[start:i] + self.gru_norm(self.gru_out(seg_out.squeeze(0)))
+                start = i
+        return out
+
+    def _slice_positions(self, slot_indices):
+        """Normalized [0,1] position of each slice WITHIN ITS OWN slot run.
+
+        StudyDataset.get() concatenates slots in order, so slot_indices looks
+        like [0,0,0,0, 1,1,1, 2,2] -- contiguous runs. Position is derived
+        here rather than passed in, which keeps StudyDataset, forward()'s
+        signature, and every call site unchanged.
+
+        Per-slot, not global: position 0.5 must mean "middle of the sagittal
+        stack" and "middle of the coronal stack" alike. A global 0..1 across
+        the concatenated sequence would instead encode "which slot am I in",
+        which slot_prior already handles.
+
+        A single-slice run gets 0.5 (it IS the whole series, so mid-stack is
+        the honest description) rather than 0.0, which would falsely mark it
+        as the top edge.
+        """
+        n = slot_indices.shape[0]
+        pos = torch.zeros(n, device=slot_indices.device, dtype=torch.float32)
+        start = 0
+        for i in range(1, n + 1):
+            if i == n or slot_indices[i] != slot_indices[start]:
+                seg_len = i - start
+                if seg_len == 1:
+                    pos[start:i] = 0.5
+                else:
+                    pos[start:i] = torch.linspace(0.0, 1.0, seg_len,
+                                                  device=slot_indices.device)
+                start = i
+        return pos
+
     def forward(self, x, mask, slot_indices):
         h       = self.proj(x)
+        if self.use_pos_emb:
+            # Applied BEFORE the GRU so the sequence model sees position too,
+            # and before attention scoring so scores can depend on where a
+            # slice sits in the stack.
+            p    = self._slice_positions(slot_indices)
+            bins = (p * (POS_BINS - 1)).round().long().clamp(0, POS_BINS - 1)
+            h    = h + self.pos_emb[bins]
+        if self.seq_model == "gru":
+            h   = self._run_sequence(h, slot_indices)
         scores  = self.att(h).T
         scores  = scores + self.slot_prior[:, slot_indices]
         absent  = (mask[slot_indices] < 0.5)
@@ -1462,244 +1663,6 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
     return model
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STAGE 0 (KneeMRI variant) — second, independent auxiliary ACL pretraining
-# source, parallel to the MRNet functions above (neither replaces the
-# other; either or both can run in the same session if both datasets
-# happen to be present).
-#
-# KneeMRI (Clinical Hospital Centre Rijeka, Croatia) is a public dataset
-# of 917 knee MRI exams with ACL diagnosis labels: aclDiagnosis is
-# 0=healthy, 1=partially injured, 2=completely ruptured -- collapsed to
-# binary (0 vs {1,2}) here since our own ACL target is a single
-# present/absent head, same as MRNet's. Each exam is one .pck file
-# (pickled numpy array, shape [n_slices, 320, 320], uint16), referenced
-# by the volumeFilename column in metadata.csv, laid out under
-# vol01..vol08 subfolders. The dataset also ships an ROI box per exam
-# (roiX/roiY/roiZ/roiHeight/roiWidth/roiDepth) -- unlike MRNet's whole-
-# knee slices, KneeMRI's authors localized this ROI specifically around
-# the ACL, so slices are cropped to it rather than used whole; this
-# matches the "crop to the anatomy of interest before the classifier"
-# pattern documented as a strong contributor to depth-of-field/signal
-# quality in more mature MRI-classification pipelines.
-# ══════════════════════════════════════════════════════════════════════════════
-def load_kneemri_labels(kneemri_root: Path):
-    """
-    Reads KneeMRI's metadata.csv. Returns a DataFrame with one row per
-    exam: StudyInstanceUID (built from volumeFilename, stripped of its
-    .pck extension, so it's unique and filesystem-safe), label (binary,
-    0 vs {1,2} collapsed from aclDiagnosis), and the ROI box columns
-    (kept through for use in kneemri_pck_to_pil_list).
-    """
-    csv_path = kneemri_root / "metadata.csv"
-    if not csv_path.exists():
-        raise FileNotFoundError(f"metadata.csv not found under {kneemri_root}")
-    df = pd.read_csv(csv_path)
-    required = {"aclDiagnosis", "volumeFilename", "roiX", "roiY", "roiZ",
-                "roiHeight", "roiWidth", "roiDepth"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"metadata.csv missing expected columns: {missing}")
-    df = df.copy()
-    df["StudyInstanceUID"] = df["volumeFilename"].str.replace(r"\.pck$", "", regex=True)
-    df["label"] = (df["aclDiagnosis"].astype(int) > 0).astype(float)  # {1,2} -> 1, 0 -> 0
-    return df
-
-
-def find_kneemri_pck(kneemri_root: Path, volume_filename: str):
-    """
-    metadata.csv doesn't record which vol0N subfolder a given exam lives
-    in, so this checks each in turn. Cheap: only 8 subfolders, and this
-    is only called once per exam during embedding (not per-epoch).
-    """
-    for sub in sorted(kneemri_root.glob("vol*")):
-        candidate = sub / volume_filename
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def kneemri_pck_to_pil_list(pck_path: Path, roi):
-    """
-    Loads a KneeMRI .pck volume [n_slices, 320, 320] uint16, crops each
-    slice to the exam's own ACL ROI box (roiX/roiY/roiWidth/roiHeight),
-    restricts to the ROI's depth range (roiZ +/- roiDepth/2) rather than
-    using every slice in the volume, then normalizes intensity the same
-    way mrnet_npy_to_pil_list() does (1st/99th percentile stretch to
-    uint8), so downstream handling matches MRNet's convention exactly.
-    roi is a dict/Series with keys roiX, roiY, roiZ, roiHeight, roiWidth,
-    roiDepth (all in pixel/slice-index units, per metadata.csv).
-    """
-    with open(pck_path, "rb") as f:
-        arr = pickle.load(f)
-    n_slices, h, w = arr.shape
-
-    z0 = max(0, int(roi["roiZ"] - roi["roiDepth"] / 2))
-    z1 = min(n_slices, int(roi["roiZ"] + roi["roiDepth"] / 2) + 1)
-    if z1 <= z0:
-        z0, z1 = 0, n_slices  # defensive: fall back to whole volume if the ROI depth is degenerate
-
-    y0 = max(0, int(roi["roiY"]))
-    y1 = min(h, int(roi["roiY"] + roi["roiHeight"]))
-    x0 = max(0, int(roi["roiX"]))
-    x1 = min(w, int(roi["roiX"] + roi["roiWidth"]))
-    if y1 <= y0 or x1 <= x0:
-        y0, y1, x0, x1 = 0, h, 0, w  # defensive: fall back to whole slice if the ROI box is degenerate
-
-    images = []
-    for sl in arr[z0:z1]:
-        crop = sl[y0:y1, x0:x1].astype(np.float32)
-        lo, hi = np.percentile(crop, [1, 99])
-        if hi <= lo:
-            lo, hi = float(crop.min()), float(crop.max())
-        if hi <= lo:
-            sl8 = np.zeros_like(crop, dtype=np.uint8)
-        else:
-            sl8 = (np.clip((crop - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-        images.append(Image.fromarray(sl8).convert("RGB"))
-    return images
-
-
-def embed_kneemri(kneemri_root: Path, labels_df: pd.DataFrame, processor, model, device, out_dir: Path):
-    """
-    Embeds every KneeMRI exam's ROI-cropped slices through MedSigLIP,
-    same encode_images() path used elsewhere, so results are directly
-    compatible with SlotAttentionModel/StudyDataset. One .pt file per
-    exam (KneeMRI is sagittal-only -- a single series/slot per exam,
-    unlike MRNet's 3 planes), written to the same {study}/{series}__
-    {slot}.pt layout embed_slots() uses. Single-pass (no TTA), same
-    convention as embed_mrnet().
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index_rows = []
-    for row in tqdm(labels_df.itertuples(index=False), total=len(labels_df), desc="  Embedding KneeMRI"):
-        study_id = f"kneemri_{row.StudyInstanceUID}"
-        out_path = out_dir / study_id / f"sagittal__{KNEEMRI_SLOT}.pt"
-        if out_path.exists():
-            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": "sagittal",
-                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
-                               "presence_mask": 1})
-            continue
-        pck_path = find_kneemri_pck(kneemri_root, row.volumeFilename)
-        if pck_path is None:
-            print(f"\n  [WARN] KneeMRI {study_id}: {row.volumeFilename} not found under {kneemri_root}")
-            continue
-        try:
-            roi = {"roiX": row.roiX, "roiY": row.roiY, "roiZ": row.roiZ,
-                   "roiHeight": row.roiHeight, "roiWidth": row.roiWidth, "roiDepth": row.roiDepth}
-            images = kneemri_pck_to_pil_list(pck_path, roi)
-            if not images:
-                continue
-            feats = encode_images(images, processor, model, device)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"embeddings": feats, "slot_name": KNEEMRI_SLOT, "study_uid": study_id,
-                       "series_uid": "sagittal", "laterality": None, "plane": "sagittal",
-                       "n_slices": len(images)}, out_path)
-            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": "sagittal",
-                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
-                               "presence_mask": 1})
-        except Exception as e:
-            print(f"\n  [WARN] KneeMRI {study_id}: {e}")
-    return pd.DataFrame(index_rows)
-
-
-def train_stage0_kneemri(kneemri_emb_idx: pd.DataFrame, kneemri_labels: pd.DataFrame,
-                         device, epochs=15, lr=1e-4, weight_decay=1e-4):
-    """
-    Pretrains SlotAttentionModel on KneeMRI's (binary-collapsed) ACL
-    labels only -- structurally identical to train_stage0_mrnet() above
-    (same masked-loss-on-ACL-only approach, same train/val split logic),
-    just pointed at KneeMRI's study-ID convention and label table instead
-    of MRNet's. Kept as a separate function (rather than parameterizing
-    train_stage0_mrnet) so neither dataset's code path is touched by
-    changes to the other.
-
-    Returns the trained model (best-val-AUC state loaded), or None if
-    there wasn't enough KneeMRI data to train on.
-    """
-    acl_idx = TARGETS.index("ACL")
-    study_ids = sorted(kneemri_emb_idx["StudyInstanceUID"].unique())
-    label_lookup = kneemri_labels.set_index(
-        kneemri_labels["StudyInstanceUID"].map(lambda s: f"kneemri_{s}"))["label"]
-
-    rows = []
-    for sid in study_ids:
-        if sid not in label_lookup.index:
-            continue
-        rec = {"StudyInstanceUID": sid}
-        for t in TARGETS:
-            rec[t] = float(label_lookup[sid]) if t == "ACL" else 0.0
-        rows.append(rec)
-    kneemri_lbl_df = pd.DataFrame(rows)
-    if len(kneemri_lbl_df) < 10:
-        print(f"  [WARN] Only {len(kneemri_lbl_df)} KneeMRI studies have embeddings -- skipping Stage 0")
-        return None
-
-    rng = np.random.RandomState(SAMPLE_SEED)
-    ids_arr = kneemri_lbl_df["StudyInstanceUID"].values
-    perm = rng.permutation(len(ids_arr))
-    n_val = max(1, int(0.15 * len(ids_arr)))
-    val_ids = set(ids_arr[perm[:n_val]])
-    tr_ids  = set(ids_arr[perm[n_val:]])
-
-    tr_ds = StudyDataset(kneemri_emb_idx[kneemri_emb_idx["StudyInstanceUID"].isin(tr_ids)],
-                         kneemri_lbl_df[kneemri_lbl_df["StudyInstanceUID"].isin(tr_ids)])
-    va_ds = StudyDataset(kneemri_emb_idx[kneemri_emb_idx["StudyInstanceUID"].isin(val_ids)],
-                         kneemri_lbl_df[kneemri_lbl_df["StudyInstanceUID"].isin(val_ids)])
-    print(f"  Stage 0 (KneeMRI ACL): train={len(tr_ds)}  val={len(va_ds)}")
-
-    model = SlotAttentionModel().to(device)
-    try:
-        model = torch.compile(model)
-    except Exception:
-        pass
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    y_all = np.array([float(label_lookup[s]) for s in tr_ids if s in label_lookup.index])
-    pos = y_all.sum()
-    pw = max((len(y_all) - pos) / max(pos, 1), 1.0)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
-    best_state, best_auc = None, -np.inf
-
-    for epoch in range(epochs):
-        model.train()
-        losses = []
-        for i in np.random.permutation(len(tr_ds)):
-            _, x, mask, idx, y = tr_ds.get(i)
-            x, mask, idx = x.to(device), mask.to(device), idx.to(device)
-            y_acl = y[acl_idx:acl_idx + 1].to(device)
-            opt.zero_grad()
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(x, mask, idx)
-                loss = loss_fn(out[acl_idx:acl_idx + 1], y_acl)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            scaler.step(opt)
-            scaler.update()
-            losses.append(float(loss.item()))
-
-        model.eval()
-        Y, P = [], []
-        with torch.no_grad():
-            for i in range(len(va_ds)):
-                _, x, mask, idx, y = va_ds.get(i)
-                out = torch.sigmoid(model(x.to(device), mask.to(device), idx.to(device)))
-                P.append(float(out[acl_idx].cpu()))
-                Y.append(float(y[acl_idx]))
-        auc = roc_auc_score(Y, P) if len(np.unique(Y)) > 1 else float("nan")
-        print(f"  [Stage 0] epoch {epoch+1:02d}  loss={np.mean(losses):.5f}  "
-              f"val_acl_auc={auc if auc == auc else float('nan'):.5f}")
-        if not np.isnan(auc) and auc > best_auc:
-            best_auc = auc
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    if best_state:
-        model.load_state_dict(best_state)
-    print(f"  Stage 0 (KneeMRI) best ACL val AUC: {best_auc:.5f}")
-    return model
-
-
 def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None):
     model   = SlotAttentionModel().to(device)
     if init_state_dict is not None:
@@ -2004,35 +1967,95 @@ XGB_N_ESTIMATORS = 300
 ALPHA_CANDIDATES = [round(x, 2) for x in np.arange(1.0, -0.001, -0.05)]
 
 
-def study_pooled_embedding(study, emb_df):
+# Pooling mode for the XGBoost branch's study-level features.
+#   "mean"  -- original behavior: one mean vector over every slice in the study.
+#   "multi" -- mean + max + std over all slices, plus a per-slot mean block.
+#
+# Why "multi" exists: a knee finding is usually focal. If a study has 150
+# slices and 3 show a torn ACL, averaging all 150 dilutes that evidence by
+# ~50x -- the mean vector barely moves. Max pooling preserves the strongest
+# single-slice response ("was this pattern present ANYWHERE"), std captures
+# how much the study varies slice-to-slice (uniform normal anatomy vs one
+# region that looks different), and the per-slot block keeps plane identity
+# instead of averaging sagittal/coronal/axial evidence together. Mean is
+# retained alongside them, so this strictly adds information rather than
+# trading one summary for another.
+#
+# Cost: feature width grows from EMBED_DIM to EMBED_DIM*(3+N_SLOT). PCA runs
+# immediately after and compresses back to PCA_COMPONENTS, so the XGBoost
+# input width is unchanged -- only the PCA fit sees the wider matrix.
+XGB_POOLING_MODE = os.environ.get("RSNA_XGB_POOLING", "multi").lower()
+
+
+def study_pooled_embedding(study, emb_df, mode=None):
     """
-    Mean-pool ALL slice embeddings for one study across all present slots.
+    Summarize one study's slice embeddings into a fixed-length vector.
     Reuses the exact same cached .pt files the neural net loads — zero
     extra MedSigLIP forward passes needed.
-    Returns (EMBED_DIM,) vector + (N_SLOT,) presence mask.
+
+    mode="mean"  -> (EMBED_DIM,)                    [original behavior]
+    mode="multi" -> (EMBED_DIM * (3 + N_SLOT),)     [mean|max|std|per-slot means]
+
+    Returns (features, (N_SLOT,) presence mask).
     """
+    mode = (mode or XGB_POOLING_MODE)
     rows = emb_df[emb_df["StudyInstanceUID"] == study]
     slot_to_file = {r["slot_name"]: r["embedding_file"]
                     for _, r in rows.iterrows() if r["presence_mask"] == 1}
-    tensors = []
     mask = np.zeros(N_SLOT, dtype=np.float32)
+
+    # Keep slices grouped BY SLOT (not flattened) so per-plane structure
+    # survives; the "mean" mode concatenates them back together to reproduce
+    # the original all-slices-pooled vector exactly.
+    per_slot = [None] * N_SLOT
     for s_idx, slot_name in enumerate(SLOT_NAMES):
         if slot_name in slot_to_file:
             try:
-                tensors.append(load_embedding(slot_to_file[slot_name]))
+                per_slot[s_idx] = load_embedding(slot_to_file[slot_name])
                 mask[s_idx] = 1.0
             except Exception:
                 pass
-    if not tensors:
-        return np.zeros(EMBED_DIM, dtype=np.float32), mask
-    return torch.cat(tensors, dim=0).mean(dim=0).numpy(), mask
+
+    present = [t for t in per_slot if t is not None]
+    width = EMBED_DIM if mode == "mean" else EMBED_DIM * (3 + N_SLOT)
+    if not present:
+        return np.zeros(width, dtype=np.float32), mask
+
+    all_slices = torch.cat(present, dim=0)          # [n_slices, EMBED_DIM]
+    if mode == "mean":
+        return all_slices.mean(dim=0).numpy(), mask
+
+    g_mean = all_slices.mean(dim=0)
+    g_max  = all_slices.max(dim=0).values
+    # std over a single slice is undefined (returns NaN) -- fall back to zeros,
+    # which is the honest "no variability observed" value rather than a NaN
+    # that would silently poison PCA and every downstream tree.
+    g_std  = (all_slices.std(dim=0, unbiased=False)
+              if all_slices.shape[0] > 1 else torch.zeros(EMBED_DIM))
+
+    blocks = [g_mean, g_max, g_std]
+    for s_idx in range(N_SLOT):
+        t = per_slot[s_idx]
+        # Absent slot -> zeros. The presence mask is passed to the model
+        # separately (see make_features), so a tree can distinguish
+        # "slot missing" from "slot present but genuinely near-zero".
+        blocks.append(t.mean(dim=0) if t is not None else torch.zeros(EMBED_DIM))
+
+    feats = torch.cat(blocks, dim=0).numpy().astype(np.float32)
+    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats, mask
 
 
-def build_tabular_matrix(study_ids, emb_df):
-    """[n, EMBED_DIM] pooled embeddings + [n, N_SLOT] presence masks, in order."""
+def build_tabular_matrix(study_ids, emb_df, mode=None):
+    """[n, D] pooled embeddings + [n, N_SLOT] presence masks, in order.
+
+    D depends on the pooling mode (see study_pooled_embedding). Every caller
+    passes the resulting matrix straight into fit_pca/make_features, which are
+    dimension-agnostic, so widening D here needs no downstream changes.
+    """
     feats, masks = [], []
     for s in study_ids:
-        f, m = study_pooled_embedding(s, emb_df)
+        f, m = study_pooled_embedding(s, emb_df, mode=mode)
         feats.append(f)
         masks.append(m)
     return np.stack(feats).astype(np.float32), np.stack(masks).astype(np.float32)
@@ -2198,9 +2221,94 @@ def main():
     _study_set_tag = f"n{N_TOTAL_STUDIES}"
     if STUDY_LIST_CSV:
         _study_set_tag += "_" + Path(STUDY_LIST_CSV).stem
+    # The DICOM index and slot cache describe which files exist and how series
+    # map to slots -- neither depends on SLICE_MODE, and the DICOM header scan
+    # is by far the slowest step (185k files), so they stay on the shared tag
+    # and are NOT re-run when switching 2D <-> 2.5D.
     _cached_dcm_idx = WORK_DIR / f"train_dicom_index_{_study_set_tag}.csv"
-    _cached_emb_idx = WORK_DIR / f"train_embedding_index_{_study_set_tag}.csv"
     _cached_slots   = WORK_DIR / f"train_slots_cache_{_study_set_tag}.pkl"
+    # Embeddings DO depend on SLICE_MODE (it changes the encoder's input), so
+    # the embedding index carries the mode in its tag. Each mode keeps its own
+    # embedding set rather than one silently overwriting or reusing the other.
+    _emb_tag = _study_set_tag + ("_25d" if SLICE_MODE == "2.5d" else "")
+    _cached_emb_idx = WORK_DIR / f"train_embedding_index_{_emb_tag}.csv"
+
+    # POOL FRESHNESS: medsiglip_finetuned_vision.pt / stage_a_pretrained.pt /
+    # fold_*.pt / xgb_*.pkl / oof_predictions.csv are all fit against a
+    # *specific* training pool (N_TOTAL_STUDIES + SAMPLE_SEED). Unlike the
+    # DICOM/slots/embedding-index caches above, these checkpoints still use
+    # fixed filenames with no pool tag -- so re-running with a different
+    # N_TOTAL_STUDIES (e.g. 1000 -> 4349) silently kept "skipping" Stage
+    # A0/A/B and reusing checkpoints trained on the OLD, smaller pool, even
+    # though the run banner correctly reported the new pool size.
+    # check_embedding_cache_freshness() below only guards against the
+    # *encoder* changing (mtime/size of medsiglip_finetuned_vision.pt) --
+    # it can't catch this, since the encoder file itself doesn't change
+    # when Stage A0 was skipped. Guard separately here by stamping the pool
+    # tag next to the checkpoints and wiping them if it doesn't match.
+    # TWO SEPARATE SIGNATURES, because the artifacts have genuinely different
+    # dependencies and collapsing them into one wastes hours of GPU time:
+    #
+    #   ENCODER signature = pool + SLICE_MODE
+    #     Governs medsiglip_finetuned_vision.pt (Stage A0, ~3h). The encoder is
+    #     fine-tuned on raw pixels; it has no idea the downstream NN exists, so
+    #     SEQ_MODEL cannot affect it. It IS affected by SLICE_MODE, since
+    #     _study_images_for_finetune() builds its training images through the
+    #     same build_slice_images() path.
+    #
+    #   MODEL signature = encoder signature + SEQ_MODEL
+    #     Governs the NN/XGBoost checkpoints, which sit downstream of the
+    #     embeddings and DO change shape when the GRU is added.
+    #
+    # Net effect: RSNA_SEQ_MODEL=gru reuses the existing fine-tuned encoder and
+    # only retrains the cheap downstream stages.
+    _enc_sig_path  = MODEL_DIR / "encoder_signature.txt"
+    _pool_sig_path = MODEL_DIR / "training_pool_signature.txt"
+    _enc_tag = f"{_study_set_tag}_slice{SLICE_MODE}"
+    _run_tag = f"{_enc_tag}_seq{SEQ_MODEL}_pos{int(POS_EMB)}"
+
+    _prev_enc_tag  = _enc_sig_path.read_text().strip()  if _enc_sig_path.exists()  else None
+    _prev_pool_tag = _pool_sig_path.read_text().strip() if _pool_sig_path.exists() else None
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── encoder-level invalidation (expensive: forces Stage A0 to re-run) ──
+    _enc_ckpt = MODEL_DIR / "medsiglip_finetuned_vision.pt"
+    if _prev_enc_tag is not None and _prev_enc_tag != _enc_tag and _enc_ckpt.exists():
+        if KEEP_FINETUNED_ENCODER:
+            print(f"  [CACHE] Encoder config changed ({_prev_enc_tag} -> {_enc_tag}) but "
+                  f"RSNA_KEEP_ENCODER=1 — keeping the existing fine-tuned MedSigLIP.\n"
+                  f"          NOTE: it was fine-tuned under '{_prev_enc_tag}'. Embeddings "
+                  f"will still be regenerated with it under the new config, so the encoder "
+                  f"is adapted to a slightly different input than it now sees. Deliberate "
+                  f"trade-off: saves the Stage A0 re-run, at some loss of adaptation match.")
+        else:
+            _enc_ckpt.unlink()
+            print(f"  [CACHE] Encoder config changed ({_prev_enc_tag} -> {_enc_tag}) — "
+                  f"removed medsiglip_finetuned_vision.pt; Stage A0 will re-run. "
+                  f"(Set RSNA_KEEP_ENCODER=1 to reuse it instead and skip that cost.)")
+    _enc_sig_path.write_text(_enc_tag)
+
+    # ── model-level invalidation (cheap: downstream of the embedding cache) ──
+    if _prev_pool_tag != _run_tag:
+        _pool_stale = [
+            MODEL_DIR / "stage_a_pretrained.pt",
+            MODEL_DIR / "stage0_mrnet_pretrained.pt",
+            MODEL_DIR / "xgb_stage_a.pkl",
+            MODEL_DIR / "oof_predictions.csv",
+        ]
+        _pool_stale.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
+        _pool_stale.extend(MODEL_DIR.glob("fold_*.pt"))
+        _pool_stale.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
+        _pool_removed = []
+        for _sp in sorted(set(_pool_stale), key=lambda p: str(p)):
+            if _sp.exists():
+                _sp.unlink()
+                _pool_removed.append(_sp.name)
+        _pool_sig_path.write_text(_run_tag)
+        if _pool_removed:
+            print(f"  [CACHE] Model configuration changed ({_prev_pool_tag or 'unrecorded/legacy'} -> "
+                  f"{_run_tag}) — invalidated {len(_pool_removed)} config-dependent "
+                  f"checkpoint(s): {_pool_removed}")
 
     if FORCE_RESCAN:
         print("  RSNA_FORCE_RESCAN=1 — deleting cached DICOM index / slots / "
@@ -2263,6 +2371,14 @@ def main():
     if _cached_emb_idx.exists():
         print("  Found existing embedding index — skipping embed step")
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
+        # dtype=str above forces presence_mask to the STRING "0"/"1". Every
+        # downstream consumer (StudyDataset.get, study_pooled_embedding,
+        # _study_images_for_finetune) checks `presence_mask == 1` against
+        # the int 1 -- "1" == 1 is False in Python (no error, just silently
+        # False), so EVERY slot on EVERY study reads as absent and training
+        # runs on all-empty/zero-padded inputs, collapsing AUC to ~0.5.
+        # Restore the real dtype so those comparisons work as intended.
+        train_emb_idx["presence_mask"] = train_emb_idx["presence_mask"].astype(int)
     else:
         print("\n── TRAIN: Embed ──")
         processor, model_enc, device_enc = load_medsiglip()
@@ -2328,6 +2444,9 @@ def main():
                     if _mrnet_cached_emb_idx.exists():
                         print("  Found existing MRNet embedding index — skipping embed step")
                         mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
+                        # Same dtype=str/presence_mask string-vs-int bug as the
+                        # main train_emb_idx reload above -- restore real dtype.
+                        mrnet_emb_idx["presence_mask"] = mrnet_emb_idx["presence_mask"].astype(int)
                     else:
                         mrnet_processor, mrnet_model_enc, mrnet_device_enc = load_medsiglip()
                         mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, mrnet_processor,
@@ -2349,61 +2468,6 @@ def main():
                     stage0_state_dict = None
         else:
             print(f"\n── STAGE 0: skipped (MRNET_ROOT not found: {MRNET_ROOT}) ──")
-
-        # ══ STAGE 0 (KneeMRI variant) — second, independent ACL source ══
-        # Runs after the MRNet block above, seeded FROM its output if
-        # MRNet's Stage 0 ran (so both datasets' ACL signal accumulate
-        # into the same head/backbone rather than one silently
-        # overwriting the other) -- otherwise starts from the same random
-        # init Stage A would have used anyway. Either block, both, or
-        # neither can run depending on which dataset folders exist;
-        # nothing here changes the MRNet block above.
-        stage0_kneemri_path = MODEL_DIR / "stage0_kneemri_pretrained.pt"
-        if RUN_KNEEMRI_PRETRAIN:
-            print(f"\n── STAGE 0 (KneeMRI): auxiliary ACL pretraining (root: {KNEEMRI_ROOT}) ──")
-            if stage0_kneemri_path.exists():
-                print(f"  Found existing checkpoint at {stage0_kneemri_path} — skipping Stage 0 (KneeMRI) training")
-                stage0_kneemri_ckpt = torch.load(stage0_kneemri_path, map_location=device, weights_only=False)
-                stage0_state_dict = stage0_kneemri_ckpt["model_state_dict"]
-            else:
-                try:
-                    kneemri_labels = load_kneemri_labels(KNEEMRI_ROOT)
-                    _kneemri_cached_emb_idx = KNEEMRI_EMB_DIR / "kneemri_embedding_index.csv"
-                    if _kneemri_cached_emb_idx.exists():
-                        print("  Found existing KneeMRI embedding index — skipping embed step")
-                        kneemri_emb_idx = pd.read_csv(_kneemri_cached_emb_idx, dtype=str)
-                    else:
-                        kneemri_processor, kneemri_model_enc, kneemri_device_enc = load_medsiglip()
-                        kneemri_emb_idx = embed_kneemri(KNEEMRI_ROOT, kneemri_labels, kneemri_processor,
-                                                        kneemri_model_enc, kneemri_device_enc, KNEEMRI_EMB_DIR)
-                        kneemri_emb_idx.to_csv(_kneemri_cached_emb_idx, index=False)
-                        del kneemri_model_enc
-                        torch.cuda.empty_cache()
-
-                    # NOTE: like train_stage0_mrnet(), train_stage0_kneemri()
-                    # builds its own fresh SlotAttentionModel() internally and
-                    # trains it from random initialization -- it does not
-                    # accept a starting state_dict. So if MRNet's Stage 0 ran
-                    # above, its result is NOT carried into this KneeMRI
-                    # training; Stage A below will inherit whichever of the
-                    # two Stage 0 blocks ran most recently (KneeMRI, if this
-                    # block runs at all), not a genuine combination of both.
-                    # Combining them would require changing
-                    # train_stage0_mrnet/train_stage0_kneemri's signatures,
-                    # which was intentionally left alone per instruction not
-                    # to modify the existing MRNet code.
-                    stage0_kneemri_model = train_stage0_kneemri(kneemri_emb_idx, kneemri_labels, device)
-                    if stage0_kneemri_model is not None:
-                        stage0_state_dict = stage0_kneemri_model.state_dict()
-                        torch.save({"model_state_dict": stage0_state_dict,
-                                    "targets": TARGETS, "slot_names": SLOT_NAMES,
-                                    "embed_dim": EMBED_DIM, "proj_dim": PROJ_DIM}, stage0_kneemri_path)
-                        print(f"  Saved Stage 0 (KneeMRI) weights: {stage0_kneemri_path}")
-                except Exception as e:
-                    print(f"  [WARN] Stage 0 KneeMRI pretraining failed ({e}) — "
-                          "Stage A will use whatever init_state_dict was set above (MRNet's, or random).")
-        else:
-            print(f"\n── STAGE 0 (KneeMRI): skipped (KNEEMRI_ROOT not found: {KNEEMRI_ROOT}) ──")
 
         stage_a_table  = pd.DataFrame({"study": pretrain_ids})
         stage_a_gkf    = GroupKFold(n_splits=5)
@@ -2483,10 +2547,26 @@ def main():
             W_pool = soft_label_weight(Y_pool, is_real_pool, conf=conf_pool)
             X_pool = make_features(raw_embed, presence, xgb_pca)
 
-            if xgb_stage_a_path.exists():
-                print(f"  Found existing checkpoint at {xgb_stage_a_path} — skipping Stage A XGBoost training")
+            # A cached xgb_stage_a.pkl holds a PCA fitted at whatever feature
+            # width was in use when it was saved. Changing RSNA_XGB_POOLING
+            # (mean <-> multi) changes that width (EMBED_DIM vs
+            # EMBED_DIM*(3+N_SLOT)), so a stale PCA would either raise inside
+            # transform() or -- worse -- be silently mismatched. Detect the
+            # width change and retrain instead of reusing.
+            _cached_stage_a_usable = xgb_stage_a_path.exists()
+            if _cached_stage_a_usable:
                 with open(xgb_stage_a_path, "rb") as f:
                     saved = pickle.load(f)
+                _saved_width = getattr(saved.get("pca"), "n_features_in_", None)
+                if _saved_width is not None and _saved_width != raw_embed.shape[1]:
+                    print(f"  [CACHE] {xgb_stage_a_path.name} was fit on "
+                          f"{_saved_width}-dim features but current pooling mode "
+                          f"('{XGB_POOLING_MODE}') produces {raw_embed.shape[1]} — "
+                          f"retraining Stage A XGBoost instead of reusing it")
+                    _cached_stage_a_usable = False
+
+            if _cached_stage_a_usable:
+                print(f"  Found existing checkpoint at {xgb_stage_a_path} — skipping Stage A XGBoost training")
                 xgb_pca            = saved["pca"]
                 xgb_stage_a_models = saved["fold_models"]
                 stage_a_xgb_oof    = saved["oof"]
