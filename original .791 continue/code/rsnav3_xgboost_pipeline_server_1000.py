@@ -2036,6 +2036,14 @@ def main():
     if _cached_emb_idx.exists():
         print("  Found existing embedding index — skipping embed step")
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
+        # dtype=str above forces presence_mask to the STRING "0"/"1". Every
+        # downstream consumer (StudyDataset.get, study_pooled_embedding,
+        # _study_images_for_finetune) checks `presence_mask == 1` against
+        # the int 1 -- "1" == 1 is False in Python (no error, just silently
+        # False), so EVERY slot on EVERY study reads as absent and training
+        # runs on all-empty/zero-padded inputs, collapsing AUC to ~0.5.
+        # Restore the real dtype so those comparisons work as intended.
+        train_emb_idx["presence_mask"] = train_emb_idx["presence_mask"].astype(int)
     else:
         print("\n── TRAIN: Embed ──")
         processor, model_enc, device_enc = load_medsiglip()
@@ -2101,6 +2109,9 @@ def main():
                     if _mrnet_cached_emb_idx.exists():
                         print("  Found existing MRNet embedding index — skipping embed step")
                         mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
+                        # Same dtype=str/presence_mask string-vs-int bug as the
+                        # main train_emb_idx reload above -- restore real dtype.
+                        mrnet_emb_idx["presence_mask"] = mrnet_emb_idx["presence_mask"].astype(int)
                     else:
                         mrnet_processor, mrnet_model_enc, mrnet_device_enc = load_medsiglip()
                         mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, mrnet_processor,
