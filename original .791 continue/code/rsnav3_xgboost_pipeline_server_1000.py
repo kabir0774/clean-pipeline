@@ -147,6 +147,63 @@ MRNET_EMB_DIR.mkdir(parents=True, exist_ok=True)
 # the way our own DICOM slot system does -- best-effort correspondence only
 MRNET_PLANE_TO_SLOT = {"sagittal": "SAG_T1", "coronal": "COR_T1", "axial": "AX_FLUID_FS"}
 
+# ── KneeMRI (Rijeka / Stajduhar et al.) -- second external Stage 0 source ─────
+# 917 sagittal knee exams stored as pickled uint16 volumes, shape [Z, H, W].
+# metadata.csv columns:
+#   examId, seriesNo, aclDiagnosis, kneeLR,
+#   roiX, roiY, roiZ, roiHeight, roiWidth, roiDepth, volumeFilename
+#
+# aclDiagnosis is 3-class: 0 healthy (690), 1 partially injured (172),
+# 2 completely ruptured (55). Our ACL target is binary, so it must be
+# collapsed -- see KNEEMRI_POSITIVE_FROM below.
+#
+# The ROI is present on healthy exams too, so it marks WHERE THE ACL IS
+# rather than where damage is. That makes it usable as anatomical
+# localization on all 917 exams, not just the positives.
+if IS_SERVER:
+    KNEEMRI_ROOT = SERVER_ROOT / "KneeMRI" / "extracted"
+else:
+    KNEEMRI_ROOT = Path(os.environ.get("RSNA_KNEEMRI_ROOT",
+                                        r"C:\kabir\RSNA_Knee_AI\KneeMRI\extracted"))
+RUN_KNEEMRI_PRETRAIN = (os.environ.get("RSNA_RUN_KNEEMRI_PRETRAIN", "auto").lower() != "0"
+                        and KNEEMRI_ROOT.exists())
+KNEEMRI_EMB_DIR = WORK_DIR / "kneemri_embeddings"
+
+# How to collapse the 3-class aclDiagnosis into our binary ACL target:
+#   "any"  -> 1 if aclDiagnosis > 0  (partial OR full)  => 227 pos / 690 neg
+#   "full" -> 1 only if aclDiagnosis == 2 (full rupture) =>  55 pos / 862 neg
+# "any" is the default because 55 positives is very thin for pretraining, and
+# because labelling a partial tear as negative teaches the model that visible
+# ACL damage is normal -- actively wrong for a target meant to flag ACL
+# abnormality. Set RSNA_KNEEMRI_POSITIVE=full to test the stricter definition.
+KNEEMRI_POSITIVE_FROM = os.environ.get("RSNA_KNEEMRI_POSITIVE", "any").lower()
+if KNEEMRI_POSITIVE_FROM not in {"any", "full"}:
+    raise ValueError(f"RSNA_KNEEMRI_POSITIVE must be 'any' or 'full', got {KNEEMRI_POSITIVE_FROM!r}")
+
+# ROI usage. roiDepth is typically only 2-6 slices out of 32, so a tight 3D
+# crop would throw away most of the volume and leave almost no slices.
+#   "none" -> whole slices, all Z (ignores the ROI entirely)
+#   "xy"   -> crop X/Y to the ROI plus a margin, keep ALL Z slices  [default]
+#   "xyz"  -> crop X/Y AND restrict Z to the ROI band plus a margin
+# "xy" is the default: it gives the encoder spatial focus on the ACL region
+# while still showing it a full through-plane stack, which is what the
+# downstream slot-attention model will always receive.
+KNEEMRI_ROI_MODE = os.environ.get("RSNA_KNEEMRI_ROI", "xy").lower()
+if KNEEMRI_ROI_MODE not in {"none", "xy", "xyz"}:
+    raise ValueError(f"RSNA_KNEEMRI_ROI must be 'none', 'xy' or 'xyz', got {KNEEMRI_ROI_MODE!r}")
+KNEEMRI_ROI_MARGIN = float(os.environ.get("RSNA_KNEEMRI_ROI_MARGIN", "0.6"))
+
+# KneeMRI volumes are sagittal. metadata.csv records no fat-saturation flag,
+# and the source describes them as proton-density-weighted sagittal series, so
+# SAG_FLUID_NOFS is the closest slot in our scheme. Override if you disagree.
+KNEEMRI_SLOT = os.environ.get("RSNA_KNEEMRI_SLOT", "SAG_FLUID_NOFS")
+
+# Which kneeLR value means a RIGHT knee. metadata.csv does not document this,
+# and getting it backwards would mirror/reverse the wrong half of the dataset.
+# Default 1=right; verify visually before trusting it (see the QA note in
+# load_kneemri_labels). Set RSNA_KNEEMRI_RIGHT=0 to swap.
+KNEEMRI_RIGHT_VALUE = int(os.environ.get("RSNA_KNEEMRI_RIGHT", "1"))
+
 def _kaggle_dataset_variants(slug):
     """
     Kaggle sometimes mounts an attached dataset at /kaggle/input/<slug>
@@ -1560,6 +1617,171 @@ def embed_mrnet(mrnet_root: Path, labels_df: pd.DataFrame, processor, model, dev
     return pd.DataFrame(index_rows)
 
 
+def load_kneemri_labels(root: Path):
+    """Read KneeMRI metadata.csv and locate each volume file on disk.
+
+    Volumes are split across vol01..vol08 subfolders with no column recording
+    which, so this indexes the folders once and joins by filename.
+
+    Returns a DataFrame with:
+      study_id  -- "kneemri_{examId}_{seriesNo}", unique per row
+      label     -- binary ACL target per KNEEMRI_POSITIVE_FROM
+      is_right  -- bool, per KNEEMRI_RIGHT_VALUE
+      path      -- resolved absolute path to the .pck
+      roi*      -- passthrough of the six ROI columns
+    """
+    meta_path = root / "metadata.csv"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"KneeMRI metadata.csv not found at {meta_path}")
+    df = pd.read_csv(meta_path)
+
+    required = ["examId", "seriesNo", "aclDiagnosis", "kneeLR", "volumeFilename",
+                "roiX", "roiY", "roiZ", "roiHeight", "roiWidth", "roiDepth"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"KneeMRI metadata.csv missing columns: {missing}")
+
+    # index every .pck across vol* folders (and the root, just in case)
+    file_index = {}
+    for sub in sorted(root.glob("vol*")) + [root]:
+        if sub.is_dir():
+            for p in sub.glob("*.pck"):
+                file_index.setdefault(p.name, p)
+    df["path"] = df["volumeFilename"].map(lambda n: file_index.get(str(n)))
+    n_missing = int(df["path"].isna().sum())
+    if n_missing:
+        print(f"  [WARN] {n_missing}/{len(df)} KneeMRI volumes listed in metadata.csv "
+              f"were not found on disk — those rows are dropped")
+        df = df[df["path"].notna()].copy()
+
+    if KNEEMRI_POSITIVE_FROM == "full":
+        df["label"] = (df["aclDiagnosis"] == 2).astype(float)
+    else:
+        df["label"] = (df["aclDiagnosis"] > 0).astype(float)
+
+    df["is_right"] = (df["kneeLR"] == KNEEMRI_RIGHT_VALUE)
+    df["study_id"] = ("kneemri_" + df["examId"].astype(str) + "_"
+                      + df["seriesNo"].astype(str))
+    if df["study_id"].duplicated().any():
+        raise ValueError("KneeMRI examId+seriesNo is not unique — cannot build study ids")
+
+    n_pos = int(df["label"].sum())
+    print(f"  KneeMRI: {len(df)} exams  |  positives={n_pos} ({n_pos/max(len(df),1):.1%}) "
+          f"under KNEEMRI_POSITIVE='{KNEEMRI_POSITIVE_FROM}'")
+    print(f"  KneeMRI: treating kneeLR=={KNEEMRI_RIGHT_VALUE} as RIGHT "
+          f"({int(df['is_right'].sum())} of {len(df)}). metadata.csv does not "
+          f"document this — if laterality QA looks wrong, set RSNA_KNEEMRI_RIGHT "
+          f"to the other value.")
+    return df
+
+
+def kneemri_pck_to_pil_list(path, roi=None, is_right=False):
+    """Load one pickled KneeMRI volume ([Z,H,W] uint16) into a list of PIL images.
+
+    Applies the same 1-99 percentile windowing dicom_to_pil() uses, so these
+    images land in a comparable intensity distribution to our own data rather
+    than a differently-scaled one the encoder would treat as a separate domain.
+
+    roi: dict with x/y/z/height/width/depth, honored per KNEEMRI_ROI_MODE.
+    is_right: right knees get their sagittal slice order reversed, matching
+              normalise_laterality()'s sagittal branch, so left and right
+              exams present anatomy in a consistent through-plane direction.
+    """
+    with open(path, "rb") as f:
+        vol = pickle.load(f)
+    vol = np.asarray(vol)
+    if vol.ndim != 3:
+        raise ValueError(f"{path}: expected a 3D volume, got shape {vol.shape}")
+
+    if roi is not None and KNEEMRI_ROI_MODE != "none":
+        z, h, w = vol.shape
+        # ROI x/width index the horizontal axis, y/height the vertical.
+        cx, cy = float(roi["x"]), float(roi["y"])
+        rw, rh = float(roi["width"]), float(roi["height"])
+        mx, my = rw * KNEEMRI_ROI_MARGIN, rh * KNEEMRI_ROI_MARGIN
+        x0 = int(max(0, np.floor(cx - mx)));        x1 = int(min(w, np.ceil(cx + rw + mx)))
+        y0 = int(max(0, np.floor(cy - my)));        y1 = int(min(h, np.ceil(cy + rh + my)))
+        # Guard against a degenerate crop (bad ROI row) collapsing the image.
+        if x1 - x0 >= 16 and y1 - y0 >= 16:
+            vol = vol[:, y0:y1, x0:x1]
+        if KNEEMRI_ROI_MODE == "xyz":
+            cz, rd = float(roi["z"]), float(roi["depth"])
+            mz = max(2.0, rd * KNEEMRI_ROI_MARGIN)
+            z0 = int(max(0, np.floor(cz - mz)))
+            z1 = int(min(z, np.ceil(cz + rd + mz)))
+            if z1 - z0 >= 3:
+                vol = vol[z0:z1]
+
+    images = []
+    for sl in vol:
+        arr = sl.astype(np.float32)
+        lo, hi = np.percentile(arr, [1, 99])
+        if hi <= lo:
+            lo, hi = float(arr.min()), float(arr.max())
+        if hi <= lo:
+            arr8 = np.zeros_like(arr, dtype=np.uint8)
+        else:
+            arr8 = (np.clip((arr - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
+        images.append(Image.fromarray(arr8))
+
+    if is_right:
+        images = images[::-1]
+
+    if SLICE_MODE == "2.5d" and len(images) > 1:
+        ref = images[len(images) // 2].size
+        images = [g if g.size == ref else g.resize(ref, Image.BILINEAR) for g in images]
+        n = len(images)
+        return [Image.merge("RGB", (images[i-1] if i > 0 else images[i],
+                                     images[i],
+                                     images[i+1] if i < n-1 else images[i]))
+                for i in range(n)]
+    return [g.convert("RGB") for g in images]
+
+
+def embed_kneemri(labels_df: pd.DataFrame, processor, model, device, out_dir: Path):
+    """Embed every KneeMRI volume through MedSigLIP via the same encode_images()
+    path used for our own DICOM data, so the cached tensors are directly
+    loadable by StudyDataset with no special-casing.
+
+    One .pt per exam, under the single slot KNEEMRI_SLOT (these are sagittal
+    single-series exams -- there is no multi-slot structure to preserve).
+    Single-pass, no TTA, matching the train-embedding convention.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index_rows, failed = [], 0
+    for row in tqdm(labels_df.itertuples(index=False), total=len(labels_df),
+                     desc="  Embedding KneeMRI"):
+        study_id = row.study_id
+        out_path = out_dir / study_id / f"{study_id}__{KNEEMRI_SLOT}.pt"
+        if out_path.exists():
+            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": study_id,
+                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
+                               "presence_mask": 1})
+            continue
+        try:
+            roi = {"x": row.roiX, "y": row.roiY, "z": row.roiZ,
+                   "height": row.roiHeight, "width": row.roiWidth, "depth": row.roiDepth}
+            images = kneemri_pck_to_pil_list(row.path, roi=roi, is_right=bool(row.is_right))
+            if not images:
+                failed += 1
+                continue
+            feats = encode_images(images, processor, model, device)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"embeddings": feats, "slot_name": KNEEMRI_SLOT,
+                        "study_uid": study_id, "series_uid": study_id,
+                        "laterality": "R" if row.is_right else "L",
+                        "plane": "Sagittal", "n_slices": len(images)}, out_path)
+            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": study_id,
+                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
+                               "presence_mask": 1})
+        except Exception as e:
+            print(f"\n  [WARN] KneeMRI {study_id}: {e}")
+            failed += 1
+    if failed:
+        print(f"  KneeMRI: {failed} exam(s) failed to embed")
+    return pd.DataFrame(index_rows)
+
+
 def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
                        device, epochs=15, lr=1e-4, weight_decay=1e-4):
     """
@@ -1576,8 +1798,16 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
     """
     acl_idx = TARGETS.index("ACL")
     study_ids = sorted(mrnet_emb_idx["StudyInstanceUID"].unique())
-    label_lookup = mrnet_labels.set_index(
-        mrnet_labels.apply(lambda r: f"mrnet_{r['split']}_{r['id']}", axis=1))["label"]
+    # Two accepted label-frame shapes, so one trainer serves both external
+    # sources without duplicating the training loop:
+    #   MRNet   -- columns [split, id, label]; study id is built here.
+    #   KneeMRI -- already carries a "study_id" column built by
+    #              load_kneemri_labels(), so it is used directly.
+    if "study_id" in mrnet_labels.columns:
+        label_lookup = mrnet_labels.set_index("study_id")["label"]
+    else:
+        label_lookup = mrnet_labels.set_index(
+            mrnet_labels.apply(lambda r: f"mrnet_{r['split']}_{r['id']}", axis=1))["label"]
 
     # build a labels_df shaped like the rest of the pipeline expects
     # (StudyInstanceUID + TARGETS columns), with all non-ACL targets set to
@@ -1593,7 +1823,7 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
         rows.append(rec)
     mrnet_lbl_df = pd.DataFrame(rows)
     if len(mrnet_lbl_df) < 10:
-        print(f"  [WARN] Only {len(mrnet_lbl_df)} MRNet studies have embeddings -- skipping Stage 0")
+        print(f"  [WARN] Only {len(mrnet_lbl_df)} external studies have embeddings -- skipping Stage 0")
         return None
 
     rng = np.random.RandomState(SAMPLE_SEED)
@@ -1607,7 +1837,7 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
                          mrnet_lbl_df[mrnet_lbl_df["StudyInstanceUID"].isin(tr_ids)])
     va_ds = StudyDataset(mrnet_emb_idx[mrnet_emb_idx["StudyInstanceUID"].isin(val_ids)],
                          mrnet_lbl_df[mrnet_lbl_df["StudyInstanceUID"].isin(val_ids)])
-    print(f"  Stage 0 (MRNet ACL): train={len(tr_ds)}  val={len(va_ds)}")
+    print(f"  Stage 0 (external ACL): train={len(tr_ds)}  val={len(va_ds)}")
 
     model = SlotAttentionModel().to(device)
     try:
@@ -2431,31 +2661,83 @@ def main():
         # there's no reason to spend the time computing it.
         stage0_state_dict = None
         stage0_path = MODEL_DIR / "stage0_mrnet_pretrained.pt"
-        if RUN_MRNET_PRETRAIN:
-            print(f"\n── STAGE 0: MRNet auxiliary ACL pretraining (root: {MRNET_ROOT}) ──")
+        # Stage 0 can draw on two independent external ACL sources: MRNet
+        # (Stanford) and KneeMRI (Rijeka). Both are embedded through the SAME
+        # MedSigLIP + encode_images() path as our own data, and both feed the
+        # same ACL-masked trainer, so they are simply concatenated into one
+        # pretraining pool rather than run as two separate stages. Whichever
+        # roots exist get used; if neither does, Stage 0 skips as before.
+        if RUN_MRNET_PRETRAIN or RUN_KNEEMRI_PRETRAIN:
+            _sources = ([f"MRNet({MRNET_ROOT})"] if RUN_MRNET_PRETRAIN else []) + \
+                        ([f"KneeMRI({KNEEMRI_ROOT})"] if RUN_KNEEMRI_PRETRAIN else [])
+            print(f"\n── STAGE 0: external ACL pretraining — {', '.join(_sources)} ──")
             if stage0_path.exists():
                 print(f"  Found existing checkpoint at {stage0_path} — skipping Stage 0 training")
                 stage0_ckpt = torch.load(stage0_path, map_location=device, weights_only=False)
                 stage0_state_dict = stage0_ckpt["model_state_dict"]
             else:
                 try:
-                    mrnet_labels = load_mrnet_labels(MRNET_ROOT)
-                    _mrnet_cached_emb_idx = MRNET_EMB_DIR / "mrnet_embedding_index.csv"
-                    if _mrnet_cached_emb_idx.exists():
-                        print("  Found existing MRNet embedding index — skipping embed step")
-                        mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
-                        # Same dtype=str/presence_mask string-vs-int bug as the
-                        # main train_emb_idx reload above -- restore real dtype.
-                        mrnet_emb_idx["presence_mask"] = mrnet_emb_idx["presence_mask"].astype(int)
-                    else:
-                        mrnet_processor, mrnet_model_enc, mrnet_device_enc = load_medsiglip()
-                        mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, mrnet_processor,
-                                                    mrnet_model_enc, mrnet_device_enc, MRNET_EMB_DIR)
-                        mrnet_emb_idx.to_csv(_mrnet_cached_emb_idx, index=False)
-                        del mrnet_model_enc
+                    _ext_emb_parts, _ext_lbl_parts = [], []
+                    _stage0_encoder = None   # loaded lazily, reused by both sources
+
+                    if RUN_MRNET_PRETRAIN:
+                        mrnet_labels = load_mrnet_labels(MRNET_ROOT)
+                        _mrnet_cached_emb_idx = MRNET_EMB_DIR / "mrnet_embedding_index.csv"
+                        if _mrnet_cached_emb_idx.exists():
+                            print("  Found existing MRNet embedding index — skipping embed step")
+                            mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
+                            # Same dtype=str/presence_mask string-vs-int bug as the
+                            # main train_emb_idx reload above -- restore real dtype.
+                            mrnet_emb_idx["presence_mask"] = mrnet_emb_idx["presence_mask"].astype(int)
+                        else:
+                            if _stage0_encoder is None:
+                                _stage0_encoder = load_medsiglip()
+                            _p, _m, _d = _stage0_encoder
+                            mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, _p, _m, _d,
+                                                        MRNET_EMB_DIR)
+                            mrnet_emb_idx.to_csv(_mrnet_cached_emb_idx, index=False)
+                        # normalize to the shared [study_id, label] shape
+                        _mrnet_lbl = pd.DataFrame({
+                            "study_id": mrnet_labels.apply(
+                                lambda r: f"mrnet_{r['split']}_{r['id']}", axis=1),
+                            "label": mrnet_labels["label"].astype(float)})
+                        _ext_emb_parts.append(mrnet_emb_idx)
+                        _ext_lbl_parts.append(_mrnet_lbl)
+
+                    if RUN_KNEEMRI_PRETRAIN:
+                        kneemri_labels = load_kneemri_labels(KNEEMRI_ROOT)
+                        # Embedding cache is tagged by the options that change
+                        # what the encoder actually sees, so switching ROI mode
+                        # or slice mode does not silently reuse the other's
+                        # embeddings.
+                        _km_tag = f"{KNEEMRI_ROI_MODE}_{SLICE_MODE}"
+                        _km_cached_emb_idx = KNEEMRI_EMB_DIR / f"kneemri_embedding_index_{_km_tag}.csv"
+                        _km_out_dir = KNEEMRI_EMB_DIR / _km_tag
+                        if _km_cached_emb_idx.exists():
+                            print("  Found existing KneeMRI embedding index — skipping embed step")
+                            kneemri_emb_idx = pd.read_csv(_km_cached_emb_idx, dtype=str)
+                            kneemri_emb_idx["presence_mask"] = kneemri_emb_idx["presence_mask"].astype(int)
+                        else:
+                            if _stage0_encoder is None:
+                                _stage0_encoder = load_medsiglip()
+                            _p, _m, _d = _stage0_encoder
+                            kneemri_emb_idx = embed_kneemri(kneemri_labels, _p, _m, _d, _km_out_dir)
+                            _km_cached_emb_idx.parent.mkdir(parents=True, exist_ok=True)
+                            kneemri_emb_idx.to_csv(_km_cached_emb_idx, index=False)
+                        _ext_emb_parts.append(kneemri_emb_idx)
+                        _ext_lbl_parts.append(kneemri_labels[["study_id", "label"]])
+
+                    if _stage0_encoder is not None:
+                        del _stage0_encoder
                         torch.cuda.empty_cache()
 
-                    stage0_model = train_stage0_mrnet(mrnet_emb_idx, mrnet_labels, device)
+                    ext_emb_idx = pd.concat(_ext_emb_parts, ignore_index=True)
+                    ext_labels  = pd.concat(_ext_lbl_parts, ignore_index=True)
+                    print(f"  Stage 0 pool: {ext_labels['study_id'].nunique()} exams "
+                          f"across {len(_ext_lbl_parts)} source(s), "
+                          f"{int(ext_labels['label'].sum())} ACL-positive")
+
+                    stage0_model = train_stage0_mrnet(ext_emb_idx, ext_labels, device)
                     if stage0_model is not None:
                         stage0_state_dict = stage0_model.state_dict()
                         torch.save({"model_state_dict": stage0_state_dict,
@@ -2463,11 +2745,12 @@ def main():
                                     "embed_dim": EMBED_DIM, "proj_dim": PROJ_DIM}, stage0_path)
                         print(f"  Saved Stage 0 weights: {stage0_path}")
                 except Exception as e:
-                    print(f"  [WARN] Stage 0 MRNet pretraining failed ({e}) — "
+                    print(f"  [WARN] Stage 0 external pretraining failed ({e}) — "
                           "Stage A will use random initialization as before.")
                     stage0_state_dict = None
         else:
-            print(f"\n── STAGE 0: skipped (MRNET_ROOT not found: {MRNET_ROOT}) ──")
+            print(f"\n── STAGE 0: skipped (no external dataset found; "
+                  f"MRNET_ROOT={MRNET_ROOT}, KNEEMRI_ROOT={KNEEMRI_ROOT}) ──")
 
         stage_a_table  = pd.DataFrame({"study": pretrain_ids})
         stage_a_gkf    = GroupKFold(n_splits=5)
