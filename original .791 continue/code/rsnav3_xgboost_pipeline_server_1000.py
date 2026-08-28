@@ -395,6 +395,39 @@ MEDSIGLIP_FINETUNE_MAX_IMAGES = int(os.environ.get("RSNA_STAGE_A0_MAX_IMAGES", "
 # gate whether scan/slot/embed steps are skipped.
 FORCE_RESCAN = os.environ.get("RSNA_FORCE_RESCAN", "0").lower() not in {"0", "false", "no"}
 
+# ── FOLD SAFETY ───────────────────────────────────────────────────────────────
+# The 58 gold studies are the ONLY honest measurement surface in this pipeline.
+# Three separate stages used to train on them and then report an out-of-fold AUC
+# over the same 58, which makes that number optimistic by an unknown margin:
+#
+#   1. Stage A0 fine-tunes the MedSigLIP encoder itself on the gold labels
+#      (weight 3.0). Every embedding downstream is then contaminated, and no
+#      fold split can undo it because the encoder is shared across folds.
+#   2. Stage A trains the attention model on the gold labels, and its best fold
+#      is the initialization for every Stage B fold -- so each Stage B model
+#      starts from weights that already saw its own validation studies.
+#   3. Stage B picks the best EPOCH by the score on its own validation fold,
+#      then reports that same fold's predictions as out-of-fold.
+#
+# All three default to the fold-safe behaviour now. Set these to 0 to reproduce
+# the old numbers, but treat any AUC produced that way as unmeasured.
+EXCLUDE_GOLD_FROM_STAGE_A0 = os.environ.get("RSNA_A0_EXCLUDE_GOLD", "1").lower() not in {"0", "false", "no"}
+EXCLUDE_GOLD_FROM_STAGE_A  = os.environ.get("RSNA_A_EXCLUDE_GOLD",  "1").lower() not in {"0", "false", "no"}
+FOLD_SAFE_EPOCH_SELECT     = os.environ.get("RSNA_FOLD_SAFE_EPOCHS", "1").lower() not in {"0", "false", "no"}
+# Fraction of each Stage B training fold held out purely to choose the epoch,
+# so the outer validation fold is never looked at during training.
+INNER_SELECT_FRAC = float(os.environ.get("RSNA_INNER_SELECT_FRAC", "0.2"))
+
+# torch.compile is a pessimization here, not an optimization: forward() takes a
+# different number of slices for every study, and _run_sequence/_slice_positions
+# contain data-dependent Python loops, so Dynamo re-traces almost every step.
+# Off by default; set RSNA_COMPILE=1 to opt back in.
+USE_COMPILE = os.environ.get("RSNA_COMPILE", "0").lower() not in {"0", "false", "no"}
+
+# Per-study training is batch size 1, which makes gradients extremely noisy.
+# Accumulate before stepping instead -- same memory, much steadier updates.
+ACCUM_STEPS = max(1, int(os.environ.get("RSNA_ACCUM_STEPS", "8")))
+
 # ── 2.5D slice channels ───────────────────────────────────────────────────────
 # "2d"   : each slice replicated to R=G=B (previous behaviour, exactly).
 # "2.5d" : channels are (prev, current, next) physical neighbours, giving the
@@ -951,7 +984,11 @@ def check_embedding_cache_freshness(work_dir):
 
     # Per-study train/test .pt files are checked individually by embed_slots,
     # so removing only train_embedding_index.csv is not sufficient.
-    embedding_dir = work_dir / "embeddings"
+    # BUGFIX: embeddings live under CACHE_DIR (EMB_DIR), which is only equal to
+    # WORK_DIR when RSNA_CACHE_DIR is unset. With a separate cache dir this
+    # deleted an empty/irrelevant WORK_DIR/embeddings and left the real, stale
+    # embeddings in place -- silently mixing two encoders' features.
+    embedding_dir = EMB_DIR
     if embedding_dir.exists():
         n_embedding_files = sum(1 for p in embedding_dir.rglob("*") if p.is_file())
         shutil.rmtree(embedding_dir)
@@ -1198,6 +1235,7 @@ def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train
     trainable = [p for p in model.vision_model.parameters() if p.requires_grad] + list(head.parameters())
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
+    holdout_auc = float("nan")   # referenced after the loop; epochs=0 is legal
 
     def _forward_study(study):
         images = _study_images_for_finetune(study, train_slots, train_dcm, train_lat)
@@ -1421,19 +1459,41 @@ def load_embedding(path):
     return x
 
 
+def build_slot_file_map(emb_df):
+    """{StudyInstanceUID: {slot_name: embedding_file}} for present slots only.
+
+    Built once per dataset instead of re-filtering the whole embedding index on
+    every __getitem__. The old `emb_df[emb_df["StudyInstanceUID"] == study]`
+    inside get() is a full linear scan of a 4,349-study x 6-slot frame, executed
+    once per study per epoch per fold -- i.e. quadratic in the pool size, and by
+    far the largest fixed cost in Stage A. Same values, one pass.
+    """
+    m = {}
+    cols = emb_df[["StudyInstanceUID", "slot_name", "embedding_file", "presence_mask"]]
+    for study, slot, path, present in cols.itertuples(index=False, name=None):
+        # presence_mask can arrive as int, float or numpy scalar depending on
+        # whether the index was just built or reloaded from CSV.
+        if int(present) == 1:
+            m.setdefault(str(study), {})[slot] = path
+    return m
+
+
 class StudyDataset:
     def __init__(self, emb_df, labels_df):
         self.emb_df = emb_df
         self.labels = labels_df.set_index("StudyInstanceUID")
         self.ids    = sorted(emb_df["StudyInstanceUID"].unique())
+        self._slot_map = build_slot_file_map(emb_df)
+        # Label lookup as plain numpy, so the per-study .loc[study, TARGETS]
+        # (which re-does a pandas indexing + astype on every access) happens once.
+        self._y = {str(s): self.labels.loc[s, TARGETS].astype(float).to_numpy(dtype=np.float32)
+                   for s in self.ids}
 
     def __len__(self): return len(self.ids)
 
     def get(self, i):
         study = self.ids[i]
-        rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
-        slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
+        slot_to_file = self._slot_map.get(str(study), {})
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1449,8 +1509,7 @@ class StudyDataset:
             slot_indices = [0]
         x   = torch.cat(tensors, dim=0)
         idx = torch.tensor(slot_indices, dtype=torch.long)
-        y   = torch.tensor(self.labels.loc[study, TARGETS].astype(float).values,
-                           dtype=torch.float32)
+        y   = torch.from_numpy(self._y[str(study)]).clone()
         return study, x, mask, idx, y
 
 
@@ -1840,10 +1899,11 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
     print(f"  Stage 0 (external ACL): train={len(tr_ds)}  val={len(va_ds)}")
 
     model = SlotAttentionModel().to(device)
-    try:
-        model = torch.compile(model)
-    except Exception:
-        pass
+    if USE_COMPILE:
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     y_all = np.array([float(label_lookup[s]) for s in tr_ids if s in label_lookup.index])
@@ -1893,18 +1953,33 @@ def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
     return model
 
 
-def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None):
+def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None,
+               weight_map=None):
+    """weight_map: optional {StudyInstanceUID: float32[len(TARGETS)]} of
+    per-target confidence weights (see soft_label_weight).
+
+    The XGBoost branch already weighted weak labels by the parser's own __conf
+    score, but the neural branch trained every weak label at equal weight -- so
+    a target the parser was 0.3 confident about pushed the attention model
+    exactly as hard as a gold 0/1. Passing the same weights the trees use makes
+    the two branches consistent and stops low-evidence parser guesses from
+    dominating a 4,000-study pool.
+    """
     model   = SlotAttentionModel().to(device)
     if init_state_dict is not None:
         # Seed from Stage 0 (MRNet ACL auxiliary pretraining) weights when
         # given, instead of the model's random initialization. Safe no-op
         # when init_state_dict is None (all existing call sites unaffected).
         model = load_state_dict_safe(model, init_state_dict)
-    # torch.compile gives ~15% speedup on PyTorch 2.0+ (safe, no result change)
-    try:
-        model = torch.compile(model)
-    except Exception:
-        pass  # older PyTorch — skip compile
+    # torch.compile is OFF by default here (RSNA_COMPILE=1 to enable). Every
+    # study has a different slice count, and forward() contains data-dependent
+    # Python loops (_run_sequence, _slice_positions, the 12-head loop), so Dynamo
+    # re-traces on nearly every step instead of amortizing a compile.
+    if USE_COMPILE:
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass  # older PyTorch — skip compile
     opt     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
@@ -1912,23 +1987,40 @@ def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None):
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+    # Unreduced twin, used only when per-study/per-target weights are supplied.
+    loss_fn_w = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
+                                     reduction="none")
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
         model.train()
         losses = []
-        for i in np.random.permutation(len(train_ds)):
-            _, x, mask, idx, y = train_ds.get(i)
+        # Studies have different slice counts so they cannot be stacked into a
+        # real batch, which meant every optimizer step was taken on a SINGLE
+        # study -- maximally noisy gradients, and 15 of those steps per epoch on
+        # a 12-study fold. Accumulate ACCUM_STEPS studies per step instead: same
+        # memory, same number of forward passes, far steadier updates.
+        opt.zero_grad(set_to_none=True)
+        _n = len(train_ds)
+        for _k, i in enumerate(np.random.permutation(_n), 1):
+            _sid, x, mask, idx, y = train_ds.get(i)
             x, mask, idx, y = x.to(device, non_blocking=True), mask.to(device, non_blocking=True), idx.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            opt.zero_grad()
+            _w = None if weight_map is None else weight_map.get(str(_sid))
             with torch.amp.autocast("cuda", enabled=device.type=="cuda"):
-                loss = loss_fn(model(x, mask, idx), y)
+                _logits = model(x, mask, idx)
+                if _w is None:
+                    loss = loss_fn(_logits, y) / ACCUM_STEPS
+                else:
+                    _wt = torch.as_tensor(_w, dtype=torch.float32, device=device)
+                    loss = (loss_fn_w(_logits, y) * _wt).mean() / ACCUM_STEPS
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            scaler.step(opt)
-            scaler.update()
-            losses.append(float(loss.item()))
+            losses.append(float(loss.item()) * ACCUM_STEPS)
+            if _k % ACCUM_STEPS == 0 or _k == _n:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
 
         model.eval()
         Y, P = [], []
@@ -1948,11 +2040,19 @@ def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None):
     return model
 
 
-def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
+def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5,
+                  select_on_val=True, weight_map=None):
     """
     Same loop as train_fold, but takes an already-initialized model (e.g.
     Stage A weak-label weights) and fine-tunes it with a smaller LR instead
     of training from scratch. Used for Stage B (58 real labels).
+
+    select_on_val=False returns the FINAL-epoch weights instead of the
+    best-scoring ones. Callers that will later report val_ds as out-of-fold
+    must pass False (or pass an inner selection split as val_ds), because
+    keeping the epoch that happened to score highest on a 12-study fold is
+    model selection on the evaluation set -- worth several AUC points of
+    pure optimism at this sample size.
     """
     opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
@@ -1961,23 +2061,40 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+    # Unreduced twin, used only when per-study/per-target weights are supplied.
+    loss_fn_w = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
+                                     reduction="none")
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
         model.train()
         losses = []
-        for i in np.random.permutation(len(train_ds)):
-            _, x, mask, idx, y = train_ds.get(i)
+        # Studies have different slice counts so they cannot be stacked into a
+        # real batch, which meant every optimizer step was taken on a SINGLE
+        # study -- maximally noisy gradients, and 15 of those steps per epoch on
+        # a 12-study fold. Accumulate ACCUM_STEPS studies per step instead: same
+        # memory, same number of forward passes, far steadier updates.
+        opt.zero_grad(set_to_none=True)
+        _n = len(train_ds)
+        for _k, i in enumerate(np.random.permutation(_n), 1):
+            _sid, x, mask, idx, y = train_ds.get(i)
             x, mask, idx, y = x.to(device, non_blocking=True), mask.to(device, non_blocking=True), idx.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            opt.zero_grad()
+            _w = None if weight_map is None else weight_map.get(str(_sid))
             with torch.amp.autocast("cuda", enabled=device.type=="cuda"):
-                loss = loss_fn(model(x, mask, idx), y)
+                _logits = model(x, mask, idx)
+                if _w is None:
+                    loss = loss_fn(_logits, y) / ACCUM_STEPS
+                else:
+                    _wt = torch.as_tensor(_w, dtype=torch.float32, device=device)
+                    loss = (loss_fn_w(_logits, y) * _wt).mean() / ACCUM_STEPS
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            scaler.step(opt)
-            scaler.update()
-            losses.append(float(loss.item()))
+            losses.append(float(loss.item()) * ACCUM_STEPS)
+            if _k % ACCUM_STEPS == 0 or _k == _n:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
 
         model.eval()
         Y, P = [], []
@@ -1989,11 +2106,12 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
                 Y.append(y.numpy())
         auc = auc_mean(np.vstack(Y), np.vstack(P))
         print(f"  [finetune] epoch {epoch+1:02d}  loss={np.mean(losses):.5f}  val_auc={auc:.5f}")
-        if not np.isnan(auc) and auc > best_auc:
+        if select_on_val and not np.isnan(auc) and auc > best_auc:
             best_auc   = auc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    if best_state: model.load_state_dict(best_state)
+    if select_on_val and best_state:
+        model.load_state_dict(best_state)
     return model
 
 
@@ -2004,14 +2122,13 @@ class InferDataset:
     def __init__(self, emb_df):
         self.emb_df = emb_df
         self.ids    = sorted(emb_df["StudyInstanceUID"].unique())
+        self._slot_map = build_slot_file_map(emb_df)
 
     def __len__(self): return len(self.ids)
 
     def get(self, i):
         study = self.ids[i]
-        rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
-        slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
+        slot_to_file = self._slot_map.get(str(study), {})
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -2035,7 +2152,9 @@ def run_inference(emb_df, model_paths, device):
     for mp in model_paths:
         model = SlotAttentionModel().to(device)
         ckpt  = torch.load(mp, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        # load_state_dict_safe, not raw load_state_dict: fold checkpoints saved
+        # from a torch.compile'd model carry an "_orig_mod." prefix on every key.
+        model = load_state_dict_safe(model, ckpt["model_state_dict"])
         model.eval()
         preds = np.zeros((len(ds), len(TARGETS)), dtype=np.float32)
         with torch.no_grad():
@@ -2103,6 +2222,14 @@ def apply_guarded_pseudo_labels(weak_df, weak_emb_idx, model_paths, device,
     img_pred_by_study = {sid: img_preds[i] for i, sid in enumerate(img_study_ids)}
 
     updated_df = weak_df.copy()
+    # .at[sid, col] below requires a unique index; a duplicated StudyInstanceUID
+    # (easy to introduce when label CSVs are concatenated) makes it return a
+    # Series and raise, aborting the whole pseudo-labeling pass.
+    n_dupes = int(updated_df["StudyInstanceUID"].duplicated().sum())
+    if n_dupes:
+        print(f"  [WARN] {n_dupes} duplicate StudyInstanceUID rows in the weak label "
+              f"set — keeping the first of each")
+        updated_df = updated_df.drop_duplicates(subset="StudyInstanceUID", keep="first")
     updated_df = updated_df.set_index("StudyInstanceUID", drop=False)
     report_rows = []
 
@@ -2217,7 +2344,7 @@ ALPHA_CANDIDATES = [round(x, 2) for x in np.arange(1.0, -0.001, -0.05)]
 XGB_POOLING_MODE = os.environ.get("RSNA_XGB_POOLING", "multi").lower()
 
 
-def study_pooled_embedding(study, emb_df, mode=None):
+def study_pooled_embedding(study, emb_df, mode=None, slot_map=None):
     """
     Summarize one study's slice embeddings into a fixed-length vector.
     Reuses the exact same cached .pt files the neural net loads — zero
@@ -2229,9 +2356,11 @@ def study_pooled_embedding(study, emb_df, mode=None):
     Returns (features, (N_SLOT,) presence mask).
     """
     mode = (mode or XGB_POOLING_MODE)
-    rows = emb_df[emb_df["StudyInstanceUID"] == study]
-    slot_to_file = {r["slot_name"]: r["embedding_file"]
-                    for _, r in rows.iterrows() if r["presence_mask"] == 1}
+    # slot_map, when supplied by build_tabular_matrix, replaces a per-study
+    # linear scan of emb_df with a dict lookup (see build_slot_file_map).
+    if slot_map is None:
+        slot_map = build_slot_file_map(emb_df)
+    slot_to_file = slot_map.get(str(study), {})
     mask = np.zeros(N_SLOT, dtype=np.float32)
 
     # Keep slices grouped BY SLOT (not flattened) so per-plane structure
@@ -2283,9 +2412,10 @@ def build_tabular_matrix(study_ids, emb_df, mode=None):
     passes the resulting matrix straight into fit_pca/make_features, which are
     dimension-agnostic, so widening D here needs no downstream changes.
     """
+    slot_map = build_slot_file_map(emb_df)
     feats, masks = [], []
     for s in study_ids:
-        f, m = study_pooled_embedding(s, emb_df, mode=mode)
+        f, m = study_pooled_embedding(s, emb_df, mode=mode, slot_map=slot_map)
         feats.append(f)
         masks.append(m)
     return np.stack(feats).astype(np.float32), np.stack(masks).astype(np.float32)
@@ -2389,7 +2519,12 @@ def main():
     print("=" * 60)
 
     # ── load labels: parser output, NOT train.csv ──────────────────
-    test_df         = pd.read_csv(DATA_ROOT / "test.csv")
+    # Only required when we actually build a submission. On a training-only
+    # server run (RSNA_RUN_TEST_INFERENCE=0) test.csv often isn't present at
+    # all, and reading it here aborted the whole run before training started.
+    test_df = None
+    if RUN_TEST_INFERENCE:
+        test_df = pd.read_csv(DATA_ROOT / "test.csv")
     test_series_csv  = DATA_ROOT / "test_series.csv"
     train_series_csv = DATA_ROOT / "train_series.csv"
 
@@ -2432,7 +2567,7 @@ def main():
     labeled = pd.concat([real_df, weak_sample], ignore_index=True)
     print(f"Training pool total            : {len(labeled)} "
           f"({len(real_df)} real + {len(weak_sample)} weak)")
-    print(f"Test studies    : {len(test_df)}")
+    print(f"Test studies    : {len(test_df) if test_df is not None else '(test inference disabled)'}")
 
     # ══ TRAIN PIPELINE ══════════════════════════════════════════
     if IS_KAGGLE:
@@ -2494,8 +2629,14 @@ def main():
     # only retrains the cheap downstream stages.
     _enc_sig_path  = MODEL_DIR / "encoder_signature.txt"
     _pool_sig_path = MODEL_DIR / "training_pool_signature.txt"
-    _enc_tag = f"{_study_set_tag}_slice{SLICE_MODE}"
-    _run_tag = f"{_enc_tag}_seq{SEQ_MODEL}_pos{int(POS_EMB)}"
+    # The fold-safety flags change WHICH STUDIES each stage trains on, so they
+    # must be part of the cache signature. Without this, turning fold safety on
+    # would happily "skip Stage A0/A -- checkpoint exists" and reuse the exact
+    # contaminated weights the flags exist to avoid.
+    _enc_tag = f"{_study_set_tag}_slice{SLICE_MODE}_a0gold{int(not EXCLUDE_GOLD_FROM_STAGE_A0)}"
+    _run_tag = (f"{_enc_tag}_seq{SEQ_MODEL}_pos{int(POS_EMB)}"
+                f"_agold{int(not EXCLUDE_GOLD_FROM_STAGE_A)}"
+                f"_fse{int(FOLD_SAFE_EPOCH_SELECT)}")
 
     _prev_enc_tag  = _enc_sig_path.read_text().strip()  if _enc_sig_path.exists()  else None
     _prev_pool_tag = _pool_sig_path.read_text().strip() if _pool_sig_path.exists() else None
@@ -2582,10 +2723,17 @@ def main():
     # saves makes MedSigLIP a fixed, better-adapted function again, so every
     # stage after this returns to full cached speed automatically) ══
     if RUN_STAGE_A0_FINETUNE:
-        finetune_pool_ids = np.array(sorted(
-            set(labeled["StudyInstanceUID"].astype(str)) &
-            set(train_slots["StudyInstanceUID"].astype(str))
-        ))
+        _a0_pool = (set(labeled["StudyInstanceUID"].astype(str)) &
+                    set(train_slots["StudyInstanceUID"].astype(str)))
+        if EXCLUDE_GOLD_FROM_STAGE_A0:
+            _gold_all = set(real_df["StudyInstanceUID"].astype(str))
+            _dropped = _a0_pool & _gold_all
+            _a0_pool -= _gold_all
+            print(f"  [FOLD-SAFE] Stage A0 excludes {len(_dropped)} gold studies "
+                  f"({len(_a0_pool)} weak studies remain). The encoder is shared by "
+                  f"every fold, so training it on gold labels contaminates all of "
+                  f"them irreversibly. Set RSNA_A0_EXCLUDE_GOLD=0 to disable.")
+        finetune_pool_ids = np.array(sorted(_a0_pool))
         finetune_medsiglip_stage_a0(
             finetune_pool_ids, labeled, train_dcm, train_slots, train_lat,
             device.type, train_last_blocks=MEDSIGLIP_FINETUNE_BLOCKS,
@@ -2633,9 +2781,20 @@ def main():
     emb = train_emb_idx[train_emb_idx["StudyInstanceUID"].astype(str).isin(common)].copy()
 
     real_ids_common = set(real_df["StudyInstanceUID"].astype(str)) & common
-    pretrain_ids = np.array(sorted(common))
+    if EXCLUDE_GOLD_FROM_STAGE_A:
+        pretrain_ids = np.array(sorted(common - real_ids_common))
+        print(f"  [FOLD-SAFE] Stage A excludes the {len(real_ids_common)} gold studies. "
+              f"Its best fold seeds every Stage B fold, so training it on gold means "
+              f"each Stage B model starts from weights that already saw its own "
+              f"validation studies. Set RSNA_A_EXCLUDE_GOLD=0 to disable.")
+    else:
+        pretrain_ids = np.array(sorted(common))
     print(f"Pretrain pool: {len(pretrain_ids)} studies "
-          f"({len(real_ids_common)} of them real-labeled)")
+          f"({len(set(pretrain_ids) & real_ids_common)} of them real-labeled)")
+    if len(pretrain_ids) < 10:
+        raise RuntimeError(
+            f"Stage A pool collapsed to {len(pretrain_ids)} studies. Check that the "
+            f"weak-labeled studies actually have embeddings.")
 
     # Stage A: 5-fold CV on all weak+real studies
     # Best fold model (highest val AUC) used as starting point for Stage B
@@ -2752,6 +2911,29 @@ def main():
             print(f"\n── STAGE 0: skipped (no external dataset found; "
                   f"MRNET_ROOT={MRNET_ROOT}, KNEEMRI_ROOT={KNEEMRI_ROOT}) ──")
 
+        # Per-target confidence weights for the neural Stage A, built from the
+        # same soft_label_weight() the XGBoost branch uses so the two halves of
+        # the ensemble agree about how much each weak label is worth.
+        stage_a_weight_map = None
+        try:
+            _wl  = lbl.set_index("StudyInstanceUID").reindex(pretrain_ids)
+            _ys  = np.nan_to_num(_wl[TARGETS].to_numpy(dtype=np.float32))
+            _isr = np.array([sid in real_ids_common for sid in pretrain_ids])
+            _cc  = [f"{t}__conf" for t in TARGETS]
+            _cf  = (np.nan_to_num(_wl[_cc].to_numpy(dtype=np.float32))
+                    if all(c in lbl.columns for c in _cc) else None)
+            _W = soft_label_weight(_ys, _isr, conf=_cf)
+            # Normalize each target column to mean 1, so the overall loss scale
+            # (and therefore the effective learning rate) does not shift with how
+            # confident the parser happened to be on this particular pool.
+            _W = _W / np.maximum(_W.mean(axis=0, keepdims=True), 1e-6)
+            stage_a_weight_map = {str(sid): _W[i] for i, sid in enumerate(pretrain_ids)}
+            print(f"  Stage A: per-target confidence weighting ON "
+                  f"({'parser __conf columns' if _cf is not None else 'distance-from-0.5 fallback'})")
+        except Exception as e:
+            print(f"  [WARN] Could not build Stage A confidence weights ({e}) — "
+                  f"training unweighted, as before.")
+
         stage_a_table  = pd.DataFrame({"study": pretrain_ids})
         stage_a_gkf    = GroupKFold(n_splits=5)
         stage_a_models = []
@@ -2770,7 +2952,8 @@ def main():
             print(f"\nStage A FOLD {sa_fold}  train={len(pre_tr_ds)}  val={len(pre_va_ds)}")
 
             sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30,
-                                   init_state_dict=stage0_state_dict)
+                                   init_state_dict=stage0_state_dict,
+                                   weight_map=stage_a_weight_map)
 
             # evaluate this fold
             sa_model.eval()
@@ -2888,6 +3071,14 @@ def main():
     n_splits = min(5, len(ids))
     gkf      = GroupKFold(n_splits=n_splits)
     oof      = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
+    # Materialize the split ONCE. The resume path used to rebuild XGBoost OOF
+    # without it and wrote every fold's predictions over every row (see below),
+    # and the alpha search needs it to avoid tuning the blend on the same rows
+    # it scores. Also lets us assert NN and XGBoost share identical folds.
+    fold_splits  = list(gkf.split(table, groups=table.study))
+    fold_assign  = np.zeros(len(ids), dtype=int)
+    for _f, (_tri, _vi) in enumerate(fold_splits, 1):
+        fold_assign[_vi] = _f
 
     # ── XGBoost Stage B: build features once, train per-fold inside the loop below ──
     xgb_stage_b_models = []
@@ -2895,11 +3086,25 @@ def main():
     if xgb_ok and xgb_pca is not None:
         try:
             raw_embed_b, presence_b = build_tabular_matrix(ids, real_emb)
-            # Stage A XGBoost OOF predictions, reordered to match `ids`, used as
-            # meta-features — this is the actual "stacking" part: Stage B trees
-            # get to see what the Stage A model (trained 4340 studies) thought.
+            # Stage A XGBoost predictions as meta-features -- the actual
+            # "stacking" part: Stage B trees get to see what the Stage A model
+            # (trained on the weak pool) thought about each gold study.
+            #
+            # Under fold safety the gold studies are not in pretrain_ids at all,
+            # so there is no OOF row for them. That is the clean case: NO Stage A
+            # fold ever saw a gold study, so simply averaging the fold models'
+            # predictions on gold is already out-of-sample. When gold IS in the
+            # pool (RSNA_A_EXCLUDE_GOLD=0) fall back to its OOF row, which is the
+            # only non-leaky option there.
             pretrain_pos = {sid: i for i, sid in enumerate(pretrain_ids)}
-            meta_b = np.stack([stage_a_xgb_oof[pretrain_pos[sid]] for sid in ids]).astype(np.float32)
+            if all(sid in pretrain_pos for sid in ids):
+                meta_b = np.stack([stage_a_xgb_oof[pretrain_pos[sid]]
+                                   for sid in ids]).astype(np.float32)
+            else:
+                X_stage_a_gold = make_features(raw_embed_b, presence_b, xgb_pca)
+                meta_b = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
+                for _fm in xgb_stage_a_models:
+                    meta_b += predict_xgb(_fm, X_stage_a_gold) / len(xgb_stage_a_models)
             X_stage_b = make_features(raw_embed_b, presence_b, xgb_pca, extra=meta_b)
             Y_stage_b = real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32)
             xgb_oof   = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
@@ -2936,13 +3141,21 @@ def main():
         # load XGBoost folds if available
         if xgb_ok and xgb_oof is not None and _all_xgb_exist:
             try:
-                for fold in range(1, n_splits+1):
+                # BUGFIX: this used to be
+                #   xgb_oof[[i for i,s in enumerate(ids) if s in ids]] =
+                #       predict_xgb(fold_models, X_stage_b[[i for i,_ in enumerate(ids)]])
+                # `s in ids` is True for every row, so each fold's model predicted
+                # on ALL 58 studies -- including its own training studies -- and
+                # overwrote the whole array. The surviving xgb_oof was fold 5's
+                # in-sample fit on everything. That inflated the XGBoost-only AUC,
+                # which then drove the alpha search, which then set the blend used
+                # for the actual submission. Restrict each fold to its own
+                # validation rows, exactly as the training path does.
+                for fold, (_tri, _vi) in enumerate(fold_splits, 1):
                     with open(MODEL_DIR / f"xgb_fold_{fold}.pkl", "rb") as f:
                         fold_xgb_models = pickle.load(f)
                     xgb_stage_b_models.append(fold_xgb_models)
-                    xgb_oof[np.array([i for i, s in enumerate(ids)
-                                      if s in ids])] = predict_xgb(fold_xgb_models,
-                                      X_stage_b[[i for i,_ in enumerate(ids)]])
+                    xgb_oof[_vi] = predict_xgb(fold_xgb_models, X_stage_b[_vi])
                 print(f"  Loaded {len(xgb_stage_b_models)} XGBoost fold checkpoints")
             except Exception as e:
                 print(f"[WARN] XGBoost load failed ({e}) — NN-only for blend")
@@ -2950,13 +3163,35 @@ def main():
 
     else:
         # ── normal training loop ──────────────────────────────────────────────
-        for fold, (tri, vi) in enumerate(gkf.split(table, groups=table.study), 1):
+        for fold, (tri, vi) in enumerate(fold_splits, 1):
             fold_ckpt_path = MODEL_DIR / f"fold_{fold}.pt"
             tr_fold_ids = ids[tri]; va_fold_ids = ids[vi]
+
+            # Split an inner selection set out of the TRAINING fold, and choose
+            # the epoch on that. Previously the epoch was chosen by scoring
+            # va_fold_ids -- the very rows about to be reported as out-of-fold --
+            # so `oof` was the best of 15 draws against its own answer key.
+            sel_fold_ids = None
+            if FOLD_SAFE_EPOCH_SELECT:
+                _rng = np.random.RandomState(SAMPLE_SEED + fold)
+                _perm = _rng.permutation(len(tr_fold_ids))
+                _n_sel = int(round(len(tr_fold_ids) * INNER_SELECT_FRAC))
+                # Need at least 2 studies to compute an AUC at all; if the fold is
+                # too small to spare them, fall back to last-epoch weights rather
+                # than quietly reintroducing the leak.
+                if _n_sel >= 2 and len(tr_fold_ids) - _n_sel >= 4:
+                    sel_fold_ids = tr_fold_ids[_perm[:_n_sel]]
+                    tr_fold_ids  = tr_fold_ids[_perm[_n_sel:]]
+
             tr_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(tr_fold_ids)],
                                   real_lbl[real_lbl["StudyInstanceUID"].isin(tr_fold_ids)])
             va_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(va_fold_ids)],
                                   real_lbl[real_lbl["StudyInstanceUID"].isin(va_fold_ids)])
+            if sel_fold_ids is not None:
+                sel_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(sel_fold_ids)],
+                                       real_lbl[real_lbl["StudyInstanceUID"].isin(sel_fold_ids)])
+            else:
+                sel_ds = None
 
             if fold_ckpt_path.exists():
                 print(f"\nFOLD {fold}  — checkpoint already exists, loading and skipping training")
@@ -2964,10 +3199,20 @@ def main():
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, ckpt["model_state_dict"])
             else:
-                print(f"\nFOLD {fold}  train={len(tr_ds)}  val={len(va_ds)}")
+                print(f"\nFOLD {fold}  train={len(tr_ds)}  "
+                      f"select={len(sel_ds) if sel_ds is not None else 0}  val={len(va_ds)}")
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, pretrained_model.state_dict())
-                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, lr=2e-5)
+                if sel_ds is not None:
+                    # Monitor + select on the inner split; va_ds stays untouched.
+                    fold_model = finetune_fold(fold_model, tr_ds, sel_ds, device,
+                                               epochs=15, lr=2e-5, select_on_val=True)
+                else:
+                    # No inner split available -- keep the last epoch rather than
+                    # peeking at va_ds to pick one.
+                    fold_model = finetune_fold(fold_model, tr_ds, va_ds, device,
+                                               epochs=15, lr=2e-5,
+                                               select_on_val=not FOLD_SAFE_EPOCH_SELECT)
 
             fold_model.eval()
             Y, P = [], []
@@ -3011,7 +3256,14 @@ def main():
         oof_df = pd.DataFrame(oof, columns=TARGETS)
         oof_df.insert(0, "StudyInstanceUID", ids)
         oof_df.to_csv(MODEL_DIR / "oof_predictions.csv", index=False)
-        mean_auc = auc_mean(real_lbl[TARGETS].values, oof)
+        # BUGFIX: `oof` rows are ordered by ids = sorted(real_ids_common), but
+        # real_lbl is in the label CSV's original row order. Comparing the two
+        # directly pairs each prediction with a DIFFERENT study's label, so the
+        # printed AUC was ~random and disagreed with the per-target AUCs below
+        # (which already did the .loc[ids] reindex correctly). Reindex first.
+        mean_auc = auc_mean(
+            real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32),
+            oof)
 
     print(f"\nOOF Mean AUC (fine-tuned, on 58 real labels): {mean_auc:.5f}")
     print("\nPer-target AUC:")
@@ -3030,8 +3282,17 @@ def main():
     _pt, _lo, _hi = bootstrap_auc_ci(_real_Y, oof)
     print(f"\nOOF Mean AUC 90% bootstrap CI (n=58, 1000 resamples): "
           f"{_pt:.4f}  [{_lo:.4f}, {_hi:.4f}]")
-    print("  (treat AUC differences smaller than this interval's width as "
-          "noise, not evidence of improvement)")
+    print(f"  interval width = {_hi - _lo:.4f}. Treat any AUC difference smaller "
+          f"than this as noise, not evidence of improvement.")
+    print(f"  fold-safety flags: A0_EXCLUDE_GOLD={EXCLUDE_GOLD_FROM_STAGE_A0} "
+          f"A_EXCLUDE_GOLD={EXCLUDE_GOLD_FROM_STAGE_A} "
+          f"FOLD_SAFE_EPOCHS={FOLD_SAFE_EPOCH_SELECT}")
+    if not (EXCLUDE_GOLD_FROM_STAGE_A0 and EXCLUDE_GOLD_FROM_STAGE_A
+            and FOLD_SAFE_EPOCH_SELECT):
+        print("  [WARNING] One or more fold-safety flags are OFF. Some stage "
+              "trained on the same 58 studies this AUC is measured over, so the "
+              "number above is optimistic by an unknown margin and is not "
+              "comparable to a fold-safe run.")
 
     # ══ GUARDED PSEUDO-LABELING — refine weak labels using Stage B ═════
     # Uses the fine-tuned (Stage B) model, not Stage A, since Stage B has
@@ -3069,20 +3330,61 @@ def main():
             xgb_only_auc = auc_mean(
                 real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values, xgb_oof)
             print(f"\nXGBoost-only OOF AUC: {xgb_only_auc:.5f}")
+            _Y = real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32)
+
+            # NESTED alpha selection. Scanning 21 alphas over all 58 studies and
+            # keeping the best is model selection on the evaluation set: at n=58
+            # the winning alpha buys a few points of pure noise, and the reported
+            # "blended AUC" then estimates nothing. Instead, for each fold choose
+            # alpha using ONLY the other folds and score the held-out fold with
+            # it. The nested AUC is an honest estimate of what blending buys.
+            nested_blend = np.zeros_like(oof)
+            per_fold_alpha = {}
+            for f in range(1, n_splits + 1):
+                inner = fold_assign != f
+                outer = fold_assign == f
+                if inner.sum() < 2 or outer.sum() < 1:
+                    per_fold_alpha[f] = 1.0
+                    nested_blend[outer] = oof[outer]
+                    continue
+                best_a, best_v = 1.0, auc_mean(_Y[inner], oof[inner])
+                for a in ALPHA_CANDIDATES:
+                    v = auc_mean(_Y[inner], a * oof[inner] + (1 - a) * xgb_oof[inner])
+                    if not np.isnan(v) and v > best_v:
+                        best_v, best_a = v, a
+                per_fold_alpha[f] = best_a
+                nested_blend[outer] = best_a * oof[outer] + (1 - best_a) * xgb_oof[outer]
+            nested_auc = auc_mean(_Y, nested_blend)
+
+            # In-sample scan, kept only so the two numbers can be compared.
             print("\nBlend search (alpha = NN weight, 1-alpha = XGBoost weight):")
-            best_blend_auc = mean_auc
+            insample_best_auc, insample_best_alpha = mean_auc, 1.0
             for a in ALPHA_CANDIDATES:
-                blended = a * oof + (1 - a) * xgb_oof
-                blend_auc = auc_mean(
-                    real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values, blended)
+                blend_auc = auc_mean(_Y, a * oof + (1 - a) * xgb_oof)
                 marker = ""
-                if not np.isnan(blend_auc) and blend_auc > best_blend_auc:
-                    best_blend_auc = blend_auc
-                    best_alpha     = a
+                if not np.isnan(blend_auc) and blend_auc > insample_best_auc:
+                    insample_best_auc, insample_best_alpha = blend_auc, a
                     marker = "  <- best so far"
                 print(f"  alpha={a:.2f}  blended_auc={blend_auc:.5f}{marker}")
-            print(f"\nChosen alpha={best_alpha:.2f}  "
-                  f"(NN-only={mean_auc:.5f} -> blended={best_blend_auc:.5f})")
+
+            print(f"\n  per-fold alphas (each chosen without seeing the fold it "
+                  f"scores): {[per_fold_alpha[f] for f in range(1, n_splits + 1)]}")
+            print(f"  NESTED blended OOF AUC : {nested_auc:.5f}   <- the honest number")
+            print(f"  in-sample best alpha   : {insample_best_alpha:.2f} "
+                  f"-> {insample_best_auc:.5f}   (optimistic; alpha was fit on these rows)")
+
+            # Adopt a blend only if it survives nested evaluation. If choosing
+            # alpha per fold does not beat NN-alone out-of-fold, the gain in the
+            # in-sample scan was noise and blending is not justified.
+            if not np.isnan(nested_auc) and nested_auc > mean_auc:
+                best_alpha = float(np.median([per_fold_alpha[f]
+                                              for f in range(1, n_splits + 1)]))
+                print(f"\nChosen alpha={best_alpha:.2f} (median of per-fold choices); "
+                      f"nested {nested_auc:.5f} > NN-only {mean_auc:.5f}")
+            else:
+                best_alpha = 1.0
+                print(f"\nBlending REJECTED: nested {nested_auc:.5f} does not beat "
+                      f"NN-only {mean_auc:.5f}. Submitting NN-only predictions.")
         except Exception as e:
             print(f"[WARN] Blend search failed ({e}) — using NN-only predictions.")
             best_alpha = 1.0
