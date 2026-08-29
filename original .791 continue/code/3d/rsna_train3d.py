@@ -55,7 +55,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader, Dataset
 
-from rsna_volume3d import load_volume
+from rsna_volume3d import load_volume, build_volume, VOL_DEPTH, VOL_SIZE, CROP_MM
 
 TARGETS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus', 'Medial OA',
            'Lateral OA', 'PF OA', 'Effusion', 'Synovitis', "Baker's",
@@ -64,13 +64,42 @@ SLOT_NAMES = ['SAG_FLUID_FS', 'COR_FLUID_FS', 'AX_FLUID_FS',
               'SAG_FLUID_NOFS', 'COR_T1', 'SAG_T1']
 N_SLOT = len(SLOT_NAMES)
 
+# ── Kaggle environment detection, matching the main pipeline's exact pattern ─
+# On Kaggle, this script needs only the 5 fold checkpoints (+ stage_a_3d.pt),
+# NOT the 4096 training volumes -- inference only needs to build volumes for
+# the 3 test studies fresh, from the competition's own test DICOM data,
+# which is already present under /kaggle/input with no download needed.
+IS_KAGGLE = os.path.exists("/kaggle/input")
+
+
+def find_kaggle_dataset(*name_fragments):
+    """Search /kaggle/input (depth-limited) for a directory whose path
+    contains ALL given fragments, case-insensitive. Mirrors the main
+    pipeline's dataset auto-discovery so the same notebook works whether the
+    checkpoint dataset is named "rsna-3d-branch-cache" or something the user
+    renamed it to on upload -- Kaggle dataset names are not guaranteed to
+    match what a script expects, so searching by content fragment is more
+    robust than hardcoding one exact path.
+    """
+    base = Path("/kaggle/input")
+    if not base.is_dir():
+        return None
+    for depth in range(1, 4):
+        for p in base.glob("/".join(["*"] * depth)):
+            if p.is_dir():
+                low = str(p).lower()
+                if all(f.lower() in low for f in name_fragments):
+                    return p
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # BACKBONES
 # ═══════════════════════════════════════════════════════════════════════════
 class BasicBlock3D(nn.Module):
     """MedicalNet-compatible 3D basic block (matches Tencent/MedicalNet's
-    resnet.py so their published checkpoints load without renaming)."""
+    resnet.py so their published checkpoints load without renaming). Used
+    for ResNet-18/34."""
     expansion = 1
 
     def __init__(self, inplanes, planes, stride=1, downsample=None):
@@ -91,13 +120,52 @@ class BasicBlock3D(nn.Module):
         return self.relu(out + identity)
 
 
+class Bottleneck3D(nn.Module):
+    """MedicalNet-compatible 3D bottleneck block. Used for ResNet-50/101/152 --
+    NOT interchangeable with BasicBlock3D: different internal structure
+    (1x1 -> 3x3 -> 1x1 with 4x channel expansion) and a checkpoint trained
+    with one cannot be loaded into the other regardless of matching layer
+    counts, since the actual tensor shapes at each layer differ.
+    """
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv3d(inplanes, planes, 1, bias=False)
+        self.bn1 = nn.BatchNorm3d(planes)
+        self.conv2 = nn.Conv3d(planes, planes, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(planes)
+        self.conv3 = nn.Conv3d(planes, planes * self.expansion, 1, bias=False)
+        self.bn3 = nn.BatchNorm3d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        return self.relu(out + identity)
+
+
 class ResNet3D(nn.Module):
     """3D ResNet matching MedicalNet's layer naming, so published Med3D
-    checkpoints load directly. Encoder only -- no segmentation decoder."""
+    checkpoints load directly. Encoder only -- no segmentation decoder.
 
-    def __init__(self, layers, in_channels=1):
+    block: BasicBlock3D (resnet18/34) or Bottleneck3D (resnet50/101/152).
+    Passing the wrong block for a given layer count produces a model that
+    LOOKS plausible but has completely different internal tensor shapes --
+    this is exactly why load_medicalnet's checkpoint-match check below
+    verifies actual tensor shapes, not just that loading didn't error.
+    """
+
+    def __init__(self, layers, block=None, in_channels=1):
         super().__init__()
+        block = block or BasicBlock3D
         self.inplanes = 64
+        self.block = block
         self.conv1 = nn.Conv3d(in_channels, 64, kernel_size=7,
                                stride=(2, 2, 2), padding=(3, 3, 3), bias=False)
         self.bn1 = nn.BatchNorm3d(64)
@@ -107,17 +175,18 @@ class ResNet3D(nn.Module):
         self.layer2 = self._make_layer(128, layers[1], stride=2)
         self.layer3 = self._make_layer(256, layers[2], stride=2)
         self.layer4 = self._make_layer(512, layers[3], stride=2)
-        self.out_dim = 512
+        self.out_dim = 512 * block.expansion
 
     def _make_layer(self, planes, blocks, stride=1):
         downsample = None
-        if stride != 1 or self.inplanes != planes:
+        out_planes = planes * self.block.expansion
+        if stride != 1 or self.inplanes != out_planes:
             downsample = nn.Sequential(
-                nn.Conv3d(self.inplanes, planes, 1, stride=stride, bias=False),
-                nn.BatchNorm3d(planes))
-        layers = [BasicBlock3D(self.inplanes, planes, stride, downsample)]
-        self.inplanes = planes
-        layers += [BasicBlock3D(planes, planes) for _ in range(1, blocks)]
+                nn.Conv3d(self.inplanes, out_planes, 1, stride=stride, bias=False),
+                nn.BatchNorm3d(out_planes))
+        layers = [self.block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = out_planes
+        layers += [self.block(self.inplanes, planes) for _ in range(1, blocks)]
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -135,8 +204,15 @@ def load_medicalnet(arch="resnet34", checkpoint=None):
     it was pretrained, and the resulting weaker OOF would be blamed on the
     architecture rather than on the load having failed.
     """
-    layers = {"resnet18": [2, 2, 2, 2], "resnet34": [3, 4, 6, 3]}[arch]
-    model = ResNet3D(layers, in_channels=1)
+    arch_config = {
+        "resnet18": ([2, 2, 2, 2], BasicBlock3D),
+        "resnet34": ([3, 4, 6, 3], BasicBlock3D),
+        "resnet50": ([3, 4, 6, 3], Bottleneck3D),
+    }
+    if arch not in arch_config:
+        raise ValueError(f"unknown MedicalNet arch {arch!r}; choose from {list(arch_config)}")
+    layers, block = arch_config[arch]
+    model = ResNet3D(layers, block=block, in_channels=1)
     if not checkpoint:
         print(f"  [3D] {arch}: random init (no MedicalNet checkpoint given)")
         return model, model.out_dim
@@ -287,11 +363,24 @@ def collate(batch):
 # TRAIN / EVAL
 # ═══════════════════════════════════════════════════════════════════════════
 def macro_auc(y, p, threshold=0.5):
-    # y may be SOFT (weak-label parser probabilities), not just hard 0/1 --
-    # Stage A held-out validation includes weak-labeled studies. sklearn's
-    # roc_auc_score refuses continuous y outright. Threshold at 0.5 for an
-    # approximate monitoring metric; the real evaluation (Stage B, on the
-    # 58 gold labels) is already hard 0/1 and passes through unchanged.
+    """AUC per target, averaged, skipping any target with a degenerate (single-
+    class) column in this batch.
+
+    y may be SOFT (continuous parser probabilities), not just hard 0/1 --
+    Stage A's held-out split is a random slice of the whole weak+real pool,
+    so it will contain weak-labeled studies whose "ground truth" is itself a
+    confidence score, not a clean label. sklearn's roc_auc_score refuses
+    continuous-valued y outright ("continuous format is not supported"),
+    which is what crashed here originally.
+
+    Thresholding at 0.5 turns that into an approximate monitoring metric:
+    "does the model's ranking agree with the parser's best guess." This is
+    NOT a real evaluation -- parser noise means the thresholded weak label
+    isn't ground truth either, just a proxy for early-stopping/model
+    selection during Stage A. The only genuine evaluation in this file is
+    Stage B's OOF AUC, computed against the 58 real gold labels, which are
+    already hard 0/1 and pass through this threshold unchanged.
+    """
     aucs = []
     for j in range(y.shape[1]):
         col = (y[:, j] >= threshold).astype(int)
@@ -382,14 +471,117 @@ def compute_pos_weight(labels_df, ids, device, cap=5.0):
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
+def run_test_inference_inmemory(fold_paths, test_dcm_df, test_slots_df, lat_map,
+                                backbone, out_path, depth, size, crop_mm, device):
+    """Same as run_test_inference, but takes already-loaded DataFrames instead
+    of file paths.
+
+    THIS is the intended Kaggle entry point: append this call as one more
+    cell in your EXISTING notebook, right after the main pipeline's own
+    "TEST: Scan DICOMs" / "TEST: Build slots" steps, passing whatever
+    variable names it already produced (e.g. test_dcm, test_slots, test_lat).
+    No separate cache file needs to exist for this -- the main pipeline's
+    test scan is cheap (3 studies) and already runs fresh every time; this
+    just reuses its in-memory output directly instead of requiring it to
+    have been saved to disk somewhere first.
+    """
+    from cache_volumes import sort_slices
+
+    if "presence_mask" in test_slots_df.columns:
+        test_slots_df = test_slots_df.copy()
+        test_slots_df["presence_mask"] = test_slots_df["presence_mask"].astype(int)
+
+    series_files = test_dcm_df.groupby("SeriesInstanceUID")["filepath"].apply(list).to_dict()
+    rows = test_slots_df[(test_slots_df.slot_name == "SAG_FLUID_FS") &
+                         (test_slots_df.presence_mask == 1)]
+
+    print(f"  Building test volumes for {rows.StudyInstanceUID.nunique()} studies "
+          f"(fresh, not cached -- only a few studies, cheap to rebuild every run)")
+    study_vols = {}
+    for r in rows.itertuples(index=False):
+        study = str(r.StudyInstanceUID)
+        paths = [Path(p) for p in series_files.get(str(r.SeriesInstanceUID), [])
+                 if Path(p).is_file()]
+        if not paths:
+            print(f"  [WARN] {study}: no files found for its SAG_FLUID_FS series")
+            continue
+        ordered, _ = sort_slices(paths)
+        plane = str(getattr(r, "Anatomical_Plane", "Sagittal") or "Sagittal")
+        is_right = str(lat_map.get(study, "L")).upper().startswith("R")
+        vol, _ = build_volume(ordered, plane=plane, is_right=is_right,
+                              depth=depth, size=size, crop_mm=crop_mm)
+        if vol is not None:
+            study_vols[study] = vol.astype(np.float32) / 255.0
+
+    if not study_vols:
+        raise RuntimeError(
+            "No test volumes could be built from the given test_dcm_df/test_slots_df -- "
+            "check that SAG_FLUID_FS is actually present for these studies. Refusing to "
+            "write an all-default submission silently; an empty submission is a bug "
+            "worth seeing, not hiding.")
+
+    ids = sorted(study_vols)
+    x = torch.stack([torch.from_numpy(study_vols[s])[None] for s in ids]).to(device)
+
+    all_fold_preds = []
+    for fp in fold_paths:
+        m = Volume3DNet(backbone, None, 0.3).to(device)
+        ckpt = torch.load(fp, map_location=device, weights_only=True)
+        m.load_state_dict(ckpt["state_dict"])
+        m.eval()
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            logits, _ = m(x)
+        all_fold_preds.append(torch.sigmoid(logits.float()).cpu().numpy())
+        del m
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    pred = np.mean(all_fold_preds, axis=0)
+    sub = pd.DataFrame({"StudyInstanceUID": ids})
+    for j, t in enumerate(TARGETS):
+        sub[t] = pred[:, j]
+    sub.to_csv(out_path, index=False)
+    print(f"  Wrote {out_path}  shape={sub.shape}")
+    print(sub.to_string(index=False))
+    return sub
+
+
+def run_test_inference(fold_paths, test_dicom_index, test_slots_cache, backbone,
+                       out_path, depth, size, crop_mm, device):
+    """File-path convenience wrapper around run_test_inference_inmemory, for
+    the standalone-script / non-notebook usage (--test-only from the CLI).
+    Requires test_dicom_index.csv and test_slots_cache.pkl to actually exist
+    as files -- if your test-scan step doesn't persist those (many don't,
+    since scanning 3 test studies is cheap enough to just redo every run),
+    use run_test_inference_inmemory directly instead, passing the DataFrames
+    your test-scan step already produced in memory.
+    """
+    import pickle
+    dcm = pd.read_csv(test_dicom_index, dtype=str)
+    with open(test_slots_cache, "rb") as f:
+        slots_df, lat_map = pickle.load(f)
+    return run_test_inference_inmemory(fold_paths, dcm, slots_df, lat_map, backbone,
+                                       out_path, depth, size, crop_mm, device)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--volume-index", required=True,
-                    help="CSV from cache_volumes.py: StudyInstanceUID, slot_name, volume_file")
+    ap.add_argument("--volume-index", required=False, default=None,
+                    help="CSV from cache_volumes.py: StudyInstanceUID, slot_name, volume_file. "
+                         "Not required with --test-only.")
+    ap.add_argument("--test-only", action="store_true",
+                    help="Skip Stage A/B entirely; load existing fold checkpoints and run "
+                         "inference on the test studies only. This is the Kaggle submission path.")
+    ap.add_argument("--test-dicom-index", default=None,
+                    help="DICOM index covering the TEST studies (required with --test-only)")
+    ap.add_argument("--test-slots-cache", default=None,
+                    help="Slot cache covering the TEST studies (required with --test-only)")
+    ap.add_argument("--submission-out", default=None,
+                    help="Where to write the 3D branch's predictions (default: <output>/submission_3d.csv)")
     ap.add_argument("--labels", required=True, help="parsed labels CSV")
     ap.add_argument("--output", required=True)
     ap.add_argument("--backbone", default="medicalnet_resnet34",
-                    choices=["medicalnet_resnet34", "medicalnet_resnet18", "r2plus1d_18"])
+                    choices=["medicalnet_resnet34", "medicalnet_resnet18", "medicalnet_resnet50", "r2plus1d_18"])
     ap.add_argument("--medicalnet-checkpoint", default=None)
     ap.add_argument("--stage-a-epochs", type=int, default=12)
     ap.add_argument("--stage-b-epochs", type=int, default=10)
@@ -407,6 +599,53 @@ def main():
     out = Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if a.test_only:
+        # Kaggle path: skip Stage A/B entirely. Auto-discover the checkpoint
+        # dataset and the test DICOM index/slots if not given explicitly --
+        # on Kaggle, dataset mount paths are auto-generated
+        # (/kaggle/input/<dataset-slug>/...) and the exact slug depends on
+        # what the user named it at upload time, so searching by content
+        # fragment is more robust than requiring an exact hardcoded path.
+        ckpt_dir = out
+        if IS_KAGGLE and not list(ckpt_dir.glob("fold_*_3d.pt")):
+            found = find_kaggle_dataset("3d")
+            if found is None:
+                raise FileNotFoundError(
+                    "--test-only on Kaggle: no fold_*_3d.pt found under --output and "
+                    "no dataset containing '3d' found under /kaggle/input. Attach the "
+                    "checkpoint dataset (fold_1_3d.pt..fold_5_3d.pt) before running.")
+            ckpt_dir = found
+            print(f"  Kaggle: found checkpoint dataset at {ckpt_dir}")
+
+        fold_paths = sorted(ckpt_dir.glob("fold_*_3d.pt"),
+                            key=lambda p: int(p.stem.split("_")[1]))
+        if not fold_paths:
+            raise FileNotFoundError(f"No fold_*_3d.pt files found under {ckpt_dir}")
+        print(f"  Loading {len(fold_paths)} fold checkpoint(s): "
+              f"{[p.name for p in fold_paths]}")
+
+        test_dcm = a.test_dicom_index
+        test_slots = a.test_slots_cache
+        if IS_KAGGLE and (test_dcm is None or test_slots is None):
+            comp_root = find_kaggle_dataset("rsna", "knee") or find_kaggle_dataset("competitions")
+            if comp_root is None:
+                raise FileNotFoundError(
+                    "--test-only on Kaggle: --test-dicom-index/--test-slots-cache not given "
+                    "and no competition dataset auto-detected under /kaggle/input. Pass them "
+                    "explicitly, or point at wherever the main pipeline's test scan/slot "
+                    "outputs are attached as a dataset.")
+            raise FileNotFoundError(
+                f"Found competition data at {comp_root}, but this script does not scan "
+                f"DICOMs itself -- pass --test-dicom-index/--test-slots-cache pointing at "
+                f"the outputs of the main pipeline's own test-scan step (the same "
+                f"train_dicom_index.csv/train_slots_cache.pkl-equivalent files, built for "
+                f"the TEST studies), not raw competition DICOMs.")
+
+        submission_out = Path(a.submission_out) if a.submission_out else out / "submission_3d.csv"
+        run_test_inference(fold_paths, test_dcm, test_slots, a.backbone,
+                           submission_out, VOL_DEPTH, VOL_SIZE, CROP_MM, device)
+        return
 
     idx = pd.read_csv(a.volume_index, dtype={"StudyInstanceUID": str})
     lbl = pd.read_csv(a.labels, dtype={"StudyInstanceUID": str})
