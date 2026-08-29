@@ -40,34 +40,15 @@ import pydicom
 
 
 # ── configuration ────────────────────────────────────────────────────────────
-# Physical crop size in millimetres, per in-plane axis. An adult knee is
-# roughly 100-150mm across at the joint line; 140mm keeps the joint plus
-# enough surrounding tissue for findings that sit outside the joint proper
-# (Baker's cyst sits posteriorly, MCL medially, contusions can be anywhere
-# in the visible bone). Cropping tighter risks amputating exactly the
-# findings that are hardest to detect.
 CROP_MM = float(os.environ.get("RSNA_VOL3D_CROP_MM", "140"))
-
-# Output volume shape: [DEPTH, SIZE, SIZE].
 VOL_DEPTH = int(os.environ.get("RSNA_VOL3D_DEPTH", "32"))
 VOL_SIZE = int(os.environ.get("RSNA_VOL3D_SIZE", "224"))
-
-# Keep only the middle fraction of each stack, matching the 2D path's
-# SLICE_BAND. The outer ends of an MRI stack are usually edge tissue or
-# padding. Set to 0.0/1.0 to use the full stack.
 BAND_LO = float(os.environ.get("RSNA_VOL3D_BAND_LO", "0.2"))
 BAND_HI = float(os.environ.get("RSNA_VOL3D_BAND_HI", "0.8"))
 
 
 # ── DICOM reading ────────────────────────────────────────────────────────────
 def _read_slice(path):
-    """Decode one DICOM slice to float32 plus its in-plane PixelSpacing.
-
-    Returns (array, (row_mm, col_mm)) or (None, None) on failure. Spacing is
-    None when the tag is absent -- callers must handle that rather than
-    assuming a default, because silently assuming 1.0mm would produce a crop
-    covering the wrong amount of anatomy without any error being raised.
-    """
     try:
         ds = pydicom.dcmread(str(path), force=True)
         arr = ds.pixel_array.astype(np.float32)
@@ -92,18 +73,6 @@ def _read_slice(path):
 
 
 def _physical_center_crop(arr, spacing, crop_mm=CROP_MM):
-    """Crop a fixed number of millimetres around the image centre.
-
-    Two slices from different scanners with different PixelSpacing produce
-    crops covering the SAME physical extent, so the anatomy lands at a
-    consistent scale after the later resize. Without this, a 224-pixel
-    resize means different things on different scanners.
-
-    Returns (cropped_array, was_cropped). When spacing is unknown the array
-    is returned untouched and was_cropped is False -- the caller counts
-    these so a systematically missing PixelSpacing tag shows up as a number
-    rather than silently degrading every volume.
-    """
     if spacing is None:
         return arr, False
     row_mm, col_mm = spacing
@@ -117,16 +86,12 @@ def _physical_center_crop(arr, spacing, crop_mm=CROP_MM):
 
     y0, y1 = max(0, cy - half_rows), min(h, cy + half_rows)
     x0, x1 = max(0, cx - half_cols), min(w, cx + half_cols)
-    # A degenerate crop (absurd spacing value, tiny image) would destroy the
-    # slice. Fall back to the full slice rather than emitting a 3-pixel image.
     if y1 - y0 < 16 or x1 - x0 < 16:
         return arr, False
     return arr[y0:y1, x0:x1], True
 
 
 def _window_to_uint8(arr):
-    """1st-99th percentile window, matching the 2D path's dicom_to_pil so the
-    two branches see comparable intensity distributions."""
     lo, hi = np.percentile(arr, [1, 99])
     if hi <= lo:
         lo, hi = float(arr.min()), float(arr.max())
@@ -136,28 +101,11 @@ def _window_to_uint8(arr):
 
 
 def _resize_2d(arr, size):
-    """Bilinear resize to (size, size) without pulling in torch or cv2.
-
-    Uses PIL, which is already a dependency of the main pipeline.
-    """
     from PIL import Image
     return np.asarray(Image.fromarray(arr).resize((size, size), Image.BILINEAR))
 
 
 def _select_depth_indices(n_slices, depth):
-    """Choose `depth` slice indices from `n_slices` available.
-
-    Picks evenly spaced ACTUAL slices rather than interpolating between
-    them. MRI slice spacing is coarse (often 3-4mm) and neighbouring slices
-    can differ substantially, so linear interpolation along Z invents
-    tissue that was never imaged -- it produces smooth-looking volumes that
-    are partly fabricated. Selecting real slices keeps every voxel
-    something the scanner actually measured.
-
-    When there are fewer slices than requested, indices repeat. The volume
-    is then padded with duplicates rather than zeros, because a block of
-    black slices would read to a 3D conv as a real anatomical edge.
-    """
     if n_slices <= 0:
         return []
     if n_slices >= depth:
@@ -167,7 +115,6 @@ def _select_depth_indices(n_slices, depth):
 
 
 def _apply_band(paths, lo=BAND_LO, hi=BAND_HI):
-    """Keep the middle fraction of an ordered slice list."""
     n = len(paths)
     if n == 0 or (lo <= 0.0 and hi >= 1.0):
         return paths
@@ -180,22 +127,6 @@ def _apply_band(paths, lo=BAND_LO, hi=BAND_HI):
 def build_volume(ordered_paths, plane="Sagittal", is_right=False,
                  depth=VOL_DEPTH, size=VOL_SIZE, crop_mm=CROP_MM,
                  band=(BAND_LO, BAND_HI)):
-    """Build one [depth, size, size] uint8 volume from ordered DICOM paths.
-
-    ordered_paths MUST already be in physical order (the main pipeline's
-    sort_slices does this by projecting ImagePositionPatient onto the
-    dominant axis). Passing filename-ordered paths produces a volume whose
-    depth axis is anatomically scrambled, which is worse than useless for a
-    3D convolution -- there is no way to detect that here, so it is the
-    caller's responsibility.
-
-    Laterality follows the same convention as the 2D path's
-    normalise_laterality: right knees are made to resemble left ones, by
-    reversing slice order for sagittal series and mirroring left-right for
-    coronal/axial.
-
-    Returns (volume, stats_dict). Volume is None when nothing decoded.
-    """
     paths = _apply_band(list(ordered_paths), *band)
     if not paths:
         return None, {"reason": "no paths after band selection"}
@@ -226,33 +157,32 @@ def build_volume(ordered_paths, plane="Sagittal", is_right=False,
     if not slices:
         return None, {**stats, "reason": "no slices decoded"}
 
-    # A mid-series decode failure leaves fewer slices than requested; repeat
-    # the last good one so the output shape stays fixed. Shape must be
-    # invariant for batching regardless of per-study decode failures.
     while len(slices) < depth:
         slices.append(slices[-1])
     vol = np.stack(slices[:depth], axis=0)
 
     if is_right:
         if str(plane).lower().startswith("sag"):
-            vol = vol[::-1].copy()          # reverse through-plane direction
+            vol = vol[::-1].copy()
         else:
-            vol = vol[:, :, ::-1].copy()    # mirror left-right
+            vol = vol[:, :, ::-1].copy()
     return vol, stats
 
 
 def build_and_cache(study, slot_name, ordered_paths, out_dir, plane="Sagittal",
                     is_right=False, depth=VOL_DEPTH, size=VOL_SIZE,
                     crop_mm=CROP_MM, overwrite=False):
-    """Build one volume and cache it as compressed .npz.
-
-    uint8 keeps this affordable: at 32x224x224 each volume is ~1.6MB raw,
-    so ~7GB for 4,349 studies at one slot each, versus ~42GB for all six
-    slots. Compression typically halves that again since MRI has large dark
-    regions.
+    """
+    The cache filename ENCODES depth/size/crop_mm. Without this, rerunning
+    with a different --depth against an existing cache directory would find
+    files at the old filename and skip rebuilding them -- so a run intended
+    to fix an "88% padded" warning would silently do nothing while reporting
+    100% cache hits and no error. Different shape parameters produce
+    different files; there is nothing to reuse between them.
     """
     out_dir = Path(out_dir)
-    out_path = out_dir / study / f"{study}__{slot_name}.npz"
+    shape_tag = f"d{depth}_s{size}_c{int(crop_mm)}"
+    out_path = out_dir / study / f"{study}__{slot_name}__{shape_tag}.npz"
     if out_path.exists() and not overwrite:
         return out_path, {"cached": True}
     vol, stats = build_volume(ordered_paths, plane=plane, is_right=is_right,
@@ -266,6 +196,5 @@ def build_and_cache(study, slot_name, ordered_paths, out_dir, plane="Sagittal",
 
 
 def load_volume(path):
-    """Load a cached volume as uint8 [D, H, W]."""
     with np.load(path, allow_pickle=False) as z:
         return z["volume"]
