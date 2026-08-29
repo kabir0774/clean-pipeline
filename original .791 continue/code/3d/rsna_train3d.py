@@ -286,10 +286,15 @@ def collate(batch):
 # ═══════════════════════════════════════════════════════════════════════════
 # TRAIN / EVAL
 # ═══════════════════════════════════════════════════════════════════════════
-def macro_auc(y, p):
+def macro_auc(y, p, threshold=0.5):
+    # y may be SOFT (weak-label parser probabilities), not just hard 0/1 --
+    # Stage A held-out validation includes weak-labeled studies. sklearn's
+    # roc_auc_score refuses continuous y outright. Threshold at 0.5 for an
+    # approximate monitoring metric; the real evaluation (Stage B, on the
+    # 58 gold labels) is already hard 0/1 and passes through unchanged.
     aucs = []
     for j in range(y.shape[1]):
-        col = y[:, j]
+        col = (y[:, j] >= threshold).astype(int)
         if len(np.unique(col)) < 2:
             continue
         aucs.append(roc_auc_score(col, p[:, j]))
