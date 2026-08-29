@@ -1452,6 +1452,15 @@ def load_embedding(path):
                  if torch.is_tensor(v)]
         if not cands: raise ValueError(f"No tensor in {path}")
         x = cands[0]
+    # torch.load() normally strips requires_grad, but not guaranteed for every
+    # object that could have been saved here -- a tensor saved mid-autograd-
+    # graph keeps requires_grad=True on reload. Every downstream consumer of
+    # this function eventually calls .numpy(), which crashes on such a tensor
+    # with "Can't call numpy() on Tensor that requires grad." Detaching here,
+    # once, at the single source every embedding load goes through, is more
+    # reliable than trying to remember .detach() at every call site downstream.
+    if x.requires_grad:
+        x = x.detach()
     x = x.float()
     if x.ndim == 1: x = x.unsqueeze(0)
     if x.ndim != 2 or x.shape[1] != EMBED_DIM:
