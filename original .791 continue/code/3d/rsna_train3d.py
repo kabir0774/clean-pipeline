@@ -64,6 +64,12 @@ SLOT_NAMES = ['SAG_FLUID_FS', 'COR_FLUID_FS', 'AX_FLUID_FS',
               'SAG_FLUID_NOFS', 'COR_T1', 'SAG_T1']
 N_SLOT = len(SLOT_NAMES)
 
+# Intensity normalization scheme -- see VolumeDataset.__getitem__.
+# "unit" (default, matches the 0.859 run) or "zscore" (MONAI/MedicalNet convention).
+NORM_MODE = os.environ.get("RSNA_VOL3D_NORM", "unit").lower()
+if NORM_MODE not in {"unit", "zscore"}:
+    raise ValueError(f"RSNA_VOL3D_NORM must be 'unit' or 'zscore', got {NORM_MODE!r}")
+
 # ── Kaggle environment detection, matching the main pipeline's exact pattern ─
 # On Kaggle, this script needs only the 5 fold checkpoints (+ stage_a_3d.pt),
 # NOT the 4096 training volumes -- inference only needs to build volumes for
@@ -195,7 +201,7 @@ class ResNet3D(nn.Module):
         return F.adaptive_avg_pool3d(x, 1).flatten(1)
 
 
-def load_medicalnet(arch="resnet34", checkpoint=None):
+def load_medicalnet(arch="resnet34", checkpoint=None, quiet=False):
     """Build a 3D ResNet and, if a MedicalNet checkpoint is given, load it.
 
     Reports the fraction of parameters that actually matched and REFUSES a
@@ -214,7 +220,8 @@ def load_medicalnet(arch="resnet34", checkpoint=None):
     layers, block = arch_config[arch]
     model = ResNet3D(layers, block=block, in_channels=1)
     if not checkpoint:
-        print(f"  [3D] {arch}: random init (no MedicalNet checkpoint given)")
+        if not quiet:
+            print(f"  [3D] {arch}: random init (no MedicalNet checkpoint given)")
         return model, model.out_dim
 
     p = Path(checkpoint)
@@ -249,6 +256,50 @@ def load_medicalnet(arch="resnet34", checkpoint=None):
     return model, model.out_dim
 
 
+def load_monai(arch="seresnet50", depth_hint=None):
+    """MONAI 3D classification backbones, classifier stripped so our own
+    12-disease + 6-slot heads attach instead.
+
+    IMPORTANT -- random init. MONAI ships architectures, not general-purpose
+    pretrained 3D classification weights. Its Model Zoo bundles are
+    task-specific (organ segmentation), not a MedicalNet-style generic
+    pretrain. So these start from scratch exactly like the ResNet-34 run
+    that scored 0.859. The reason to use them is ARCHITECTURAL DIVERSITY
+    for the blend -- SE blocks and dense connectivity make different errors
+    than plain residual blocks, and decorrelated errors are what make an
+    ensemble worth more than its members.
+
+    DEPTH CONSTRAINT (verified empirically, not from docs): DenseNet121-3D
+    downsamples the depth axis 32x, so it CRASHES on volumes with depth < 32
+    ("input image smaller than kernel size") -- our depth-18 cache fails on
+    it. SEResNet50 handles depth 18 fine. The guard below fails fast with a
+    clear message rather than after a long run has already started.
+    """
+    import torch.nn as nn
+    if arch == "densenet121":
+        if depth_hint is not None and depth_hint < 32:
+            raise ValueError(
+                f"MONAI DenseNet121-3D requires volume depth >= 32, but the volumes "
+                f"are depth={depth_hint}. It downsamples the depth axis 32x and will "
+                f"crash mid-training otherwise. Either rebuild volumes with "
+                f"--depth 32 (expect heavy duplicate-padding, ~88% at your slice "
+                f"counts) or use --backbone monai_seresnet50, which works at depth 18.")
+        from monai.networks.nets import DenseNet121
+        net = DenseNet121(spatial_dims=3, in_channels=1, out_channels=12)
+        dim = net.class_layers.out.in_features
+        net.class_layers.out = nn.Identity()
+    elif arch == "seresnet50":
+        from monai.networks.nets import SEResNet50
+        net = SEResNet50(spatial_dims=3, in_channels=1, num_classes=12)
+        dim = net.last_linear.in_features
+        net.last_linear = nn.Identity()
+    else:
+        raise ValueError(f"unknown MONAI arch {arch!r}; use densenet121 or seresnet50")
+    print(f"  [3D] MONAI {arch}: random init (MONAI ships no general 3D "
+          f"classification pretrain), feature dim {dim}")
+    return net, dim
+
+
 def load_r2plus1d():
     """torchvision R(2+1)D-18, Kinetics-400 pretrained.
 
@@ -270,10 +321,19 @@ def load_r2plus1d():
 # ═══════════════════════════════════════════════════════════════════════════
 class Volume3DNet(nn.Module):
     def __init__(self, backbone="medicalnet_resnet34", checkpoint=None,
-                 aux_slot_weight=0.3, dropout=0.3):
+                 aux_slot_weight=0.3, dropout=0.3, quiet=False, depth_hint=None):
+        """quiet=True suppresses the init message. Used by Stage B, which
+        builds an empty model purely as a shell and immediately overwrites
+        every weight via load_state_dict(stage_a_state) -- printing
+        "random init" there is actively misleading, since the model never
+        trains from those random values."""
         super().__init__()
         if backbone.startswith("medicalnet_"):
-            self.encoder, dim = load_medicalnet(backbone.split("_", 1)[1], checkpoint)
+            self.encoder, dim = load_medicalnet(backbone.split("_", 1)[1], checkpoint,
+                                                quiet=quiet)
+            self.in_ch = 1
+        elif backbone.startswith("monai_"):
+            self.encoder, dim = load_monai(backbone.split("_", 1)[1], depth_hint=depth_hint)
             self.in_ch = 1
         elif backbone == "r2plus1d_18":
             self.encoder, dim = load_r2plus1d()
@@ -327,8 +387,12 @@ class VolumeDataset(Dataset):
         # construction, so mirroring here would undo it and teach the model
         # that left and right knees are interchangeable.
         if np.random.rand() < 0.5:      # intensity scale/shift ~ scanner variation
-            vol = np.clip(vol * np.random.uniform(0.9, 1.1)
-                          + np.random.uniform(-0.05, 0.05), 0, 1)
+            vol = vol * np.random.uniform(0.9, 1.1) + np.random.uniform(-0.05, 0.05)
+            # Clip only under "unit" normalization. z-scored volumes are
+            # legitimately negative and unbounded, so clipping to [0,1] there
+            # would destroy roughly half the signal.
+            if NORM_MODE == "unit":
+                vol = np.clip(vol, 0, 1)
         if np.random.rand() < 0.3:      # depth jitter: drop/duplicate an end slice
             k = np.random.choice([-1, 1])
             vol = np.roll(vol, k, axis=0)
@@ -336,7 +400,22 @@ class VolumeDataset(Dataset):
 
     def __getitem__(self, i):
         r = self.rows.iloc[i]
-        vol = load_volume(r["volume_file"]).astype(np.float32) / 255.0
+        vol = load_volume(r["volume_file"]).astype(np.float32)
+        # Intensity normalization. Two schemes, because they suit different
+        # initializations:
+        #   "unit"   -- divide by 255 -> [0,1]. Fine for random init, which
+        #               learns whatever scale it is given.
+        #   "zscore" -- per-volume (x - mean) / std, the MONAI/MedicalNet
+        #               convention. Pretrained medical weights were trained on
+        #               z-scored inputs, so feeding them [0,1] data puts every
+        #               filter and BatchNorm running-stat off-distribution --
+        #               a prime suspect for why MedicalNet transfer scored
+        #               WORSE (0.764) than random init (0.859) here.
+        if NORM_MODE == "zscore":
+            m, s = float(vol.mean()), float(vol.std())
+            vol = (vol - m) / (s if s > 1e-6 else 1.0)
+        else:
+            vol = vol / 255.0
         if self.augment:
             vol = self._aug(vol)
         x = torch.from_numpy(np.ascontiguousarray(vol))[None]     # [1,D,H,W]
@@ -511,7 +590,15 @@ def run_test_inference_inmemory(fold_paths, test_dcm_df, test_slots_df, lat_map,
         vol, _ = build_volume(ordered, plane=plane, is_right=is_right,
                               depth=depth, size=size, crop_mm=crop_mm)
         if vol is not None:
-            study_vols[study] = vol.astype(np.float32) / 255.0
+            v = vol.astype(np.float32)
+            # MUST match training normalization, or the model sees a
+            # different input distribution at test time than it learned on.
+            if NORM_MODE == "zscore":
+                _m, _s = float(v.mean()), float(v.std())
+                v = (v - _m) / (_s if _s > 1e-6 else 1.0)
+            else:
+                v = v / 255.0
+            study_vols[study] = v
 
     if not study_vols:
         raise RuntimeError(
@@ -581,7 +668,9 @@ def main():
     ap.add_argument("--labels", required=True, help="parsed labels CSV")
     ap.add_argument("--output", required=True)
     ap.add_argument("--backbone", default="medicalnet_resnet34",
-                    choices=["medicalnet_resnet34", "medicalnet_resnet18", "medicalnet_resnet50", "r2plus1d_18"])
+                    choices=["medicalnet_resnet34", "medicalnet_resnet18",
+                             "medicalnet_resnet50", "monai_seresnet50",
+                             "monai_densenet121", "r2plus1d_18"])
     ap.add_argument("--medicalnet-checkpoint", default=None)
     ap.add_argument("--stage-a-epochs", type=int, default=12)
     ap.add_argument("--stage-b-epochs", type=int, default=10)
@@ -663,7 +752,21 @@ def main():
 
     # ── STAGE A: all studies (weak + real) ────────────────────────────────
     stage_a_path = out / "stage_a_3d.pt"
-    model = Volume3DNet(a.backbone, a.medicalnet_checkpoint, a.aux_weight).to(device)
+    # Read the depth from an actual cached volume rather than trusting
+    # VOL_DEPTH -- cache_volumes.py takes --depth as a CLI arg, so the
+    # constant here can easily disagree with what is actually on disk. The
+    # MONAI DenseNet guard depends on this being the true value.
+    _detected_depth = None
+    try:
+        _detected_depth = int(load_volume(idx.iloc[0]["volume_file"]).shape[0])
+        print(f"Detected volume depth from cache: {_detected_depth}")
+    except Exception as e:
+        print(f"[WARN] could not detect volume depth ({e}); "
+              f"falling back to VOL_DEPTH={VOL_DEPTH}")
+        _detected_depth = VOL_DEPTH
+
+    model = Volume3DNet(a.backbone, a.medicalnet_checkpoint, a.aux_weight,
+                        depth_hint=_detected_depth).to(device)
     if stage_a_path.exists():
         print(f"\n── STAGE A (3D): found {stage_a_path.name}, loading ──")
         model.load_state_dict(torch.load(stage_a_path, map_location=device,
@@ -703,8 +806,13 @@ def main():
         tr, va = real_idx.iloc[tr_i], real_idx.iloc[va_i]
         assert not (set(tr.StudyInstanceUID) & set(va.StudyInstanceUID)), \
             "study leaked across the fold boundary"
-        fm = Volume3DNet(a.backbone, None, a.aux_weight).to(device)
+        fm = Volume3DNet(a.backbone, None, a.aux_weight, quiet=True,
+                         depth_hint=_detected_depth).to(device)
         fm.load_state_dict(stage_a_state)     # warm-start from Stage A
+        if f == 1:
+            print(f"  [3D] Stage B folds warm-start from Stage A weights "
+                  f"({len(stage_a_state)} tensors), which carry whatever "
+                  f"initialization Stage A used.")
         tr_dl = DataLoader(VolumeDataset(tr, lbl, train=True), batch_size=a.batch_size,
                            shuffle=True, num_workers=a.workers, collate_fn=collate,
                            pin_memory=True)
