@@ -15,6 +15,7 @@ import random
 import pickle
 import argparse
 import subprocess
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,7 @@ IS_KAGGLE     = os.path.exists("/kaggle/input")
 # Linux SSH/GPU server (not Kaggle, not the local Windows dev machine).
 # Same server layout used by RSNA v4.
 IS_SERVER     = (not IS_KAGGLE) and os.name == "posix"
-SERVER_ROOT   = Path(os.environ.get("RSNA_SERVER_ROOT", "/home/harleen_ece/rsna_knee_ai"))
+SERVER_ROOT   = Path("/home/harleen_ece/rsna_knee_ai")
 
 def _find_data_root():
     # Handles both the raw competition dataset and a manually-renamed copy.
@@ -67,9 +68,9 @@ def _find_data_root():
 if IS_KAGGLE:
     DATA_ROOT = _find_data_root()
 elif IS_SERVER:
-    DATA_ROOT = Path(os.environ.get("RSNA_DATA_ROOT", str(SERVER_ROOT / "DATA")))
+    DATA_ROOT = Path("/home/harleen_ece/rsna_knee_ai/DATA")
 else:
-    DATA_ROOT = Path(os.environ.get("RSNA_DATA_ROOT", r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\DATA"))
+    DATA_ROOT = Path("C:/kabir/RSNA_Knee_AI/DATA")
 # auto-find MedSigLIP on Kaggle — handles subfolder variations
 def _find_medsiglip():
     # kabirverma01/medsiglip dataset — files are in root
@@ -101,108 +102,23 @@ def _find_medsiglip():
 if IS_KAGGLE:
     MODEL_PATH = _find_medsiglip()
 elif IS_SERVER:
-    MODEL_PATH = Path(os.environ.get("RSNA_MODEL_PATH", str(SERVER_ROOT / "MedSigLIP")))
+    MODEL_PATH = Path("/home/harleen_ece/rsna_knee_ai/MedSigLIP")
 else:
-    MODEL_PATH = Path(os.environ.get("RSNA_MODEL_PATH", r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\MedSigLIP"))
+    MODEL_PATH = Path("C:/kabir/RSNA_Knee_AI/MedSigLIP")
 
 if IS_KAGGLE:
     WORK_DIR = Path("/kaggle/working")
 elif IS_SERVER:
-    WORK_DIR = Path(os.environ.get("RSNA_WORK_DIR", str(SERVER_ROOT / "rsnav4_ssh")))
+    WORK_DIR = SERVER_ROOT / "rsnav4_ssh"  # all cache/output goes here
 else:
-    WORK_DIR = Path(os.environ.get("RSNA_WORK_DIR", r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\rsna .791\runs\pc_200_best"))
+    WORK_DIR = Path("C:/kabir/RSNA/kaggle_run")
 TRAIN_SERIES  = DATA_ROOT / "train_series"
 TEST_SERIES   = DATA_ROOT / "test_series"
-# CACHE_DIR holds embeddings specifically -- separate env var from WORK_DIR
-# so a launcher can point embeddings at one experiment's cache (e.g.
-# cache_4349) while keeping models/reports under a different outputs dir
-# (e.g. outputs_4349), or share a single dir when RSNA_CACHE_DIR isn't set.
-CACHE_DIR     = Path(os.environ.get("RSNA_CACHE_DIR", str(WORK_DIR)))
-EMB_DIR       = CACHE_DIR / "embeddings"
+EMB_DIR       = WORK_DIR / "embeddings"
 MODEL_DIR     = WORK_DIR / "models"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 EMB_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Stage 0: optional MRNet auxiliary pretraining (ACL only) ──────────────
-# MRNet (Stanford, https://stanfordmlgroup.github.io/competitions/mrnet/) is
-# a public knee-MRI dataset with ACL tear labels on ~1,370 exams -- far more
-# than our own 58 real-labeled studies. Used ONLY for the ACL head (MRNet's
-# meniscus label doesn't distinguish medial/lateral, so it's skipped rather
-# than injected as an ambiguous signal into two targets that need to stay
-# separate). Entirely optional: if MRNET_ROOT doesn't exist, Stage 0 is
-# skipped automatically and training proceeds exactly as before.
-if IS_SERVER:
-    MRNET_ROOT = SERVER_ROOT / "MRNet-v1.0"
-elif IS_KAGGLE:
-    MRNET_ROOT = Path("/kaggle/input/mrnet-v1")  # only used if this dataset is attached
-else:
-    MRNET_ROOT = Path(os.environ.get("RSNA_MRNET_ROOT", r"C:\kabir\RSNA_Knee_AI\MRNet-v1.0"))
-RUN_MRNET_PRETRAIN = (os.environ.get("RSNA_RUN_MRNET_PRETRAIN", "auto").lower() != "0"
-                      and MRNET_ROOT.exists())
-MRNET_EMB_DIR = WORK_DIR / "mrnet_embeddings"
-MRNET_EMB_DIR.mkdir(parents=True, exist_ok=True)
-# loose plane->slot mapping since MRNet doesn't record fat-sat vs non-fat-sat
-# the way our own DICOM slot system does -- best-effort correspondence only
-MRNET_PLANE_TO_SLOT = {"sagittal": "SAG_T1", "coronal": "COR_T1", "axial": "AX_FLUID_FS"}
-
-# ── KneeMRI (Rijeka / Stajduhar et al.) -- second external Stage 0 source ─────
-# 917 sagittal knee exams stored as pickled uint16 volumes, shape [Z, H, W].
-# metadata.csv columns:
-#   examId, seriesNo, aclDiagnosis, kneeLR,
-#   roiX, roiY, roiZ, roiHeight, roiWidth, roiDepth, volumeFilename
-#
-# aclDiagnosis is 3-class: 0 healthy (690), 1 partially injured (172),
-# 2 completely ruptured (55). Our ACL target is binary, so it must be
-# collapsed -- see KNEEMRI_POSITIVE_FROM below.
-#
-# The ROI is present on healthy exams too, so it marks WHERE THE ACL IS
-# rather than where damage is. That makes it usable as anatomical
-# localization on all 917 exams, not just the positives.
-if IS_SERVER:
-    KNEEMRI_ROOT = SERVER_ROOT / "KneeMRI" / "extracted"
-else:
-    KNEEMRI_ROOT = Path(os.environ.get("RSNA_KNEEMRI_ROOT",
-                                        r"C:\kabir\RSNA_Knee_AI\KneeMRI\extracted"))
-RUN_KNEEMRI_PRETRAIN = (os.environ.get("RSNA_RUN_KNEEMRI_PRETRAIN", "auto").lower() != "0"
-                        and KNEEMRI_ROOT.exists())
-KNEEMRI_EMB_DIR = WORK_DIR / "kneemri_embeddings"
-
-# How to collapse the 3-class aclDiagnosis into our binary ACL target:
-#   "any"  -> 1 if aclDiagnosis > 0  (partial OR full)  => 227 pos / 690 neg
-#   "full" -> 1 only if aclDiagnosis == 2 (full rupture) =>  55 pos / 862 neg
-# "any" is the default because 55 positives is very thin for pretraining, and
-# because labelling a partial tear as negative teaches the model that visible
-# ACL damage is normal -- actively wrong for a target meant to flag ACL
-# abnormality. Set RSNA_KNEEMRI_POSITIVE=full to test the stricter definition.
-KNEEMRI_POSITIVE_FROM = os.environ.get("RSNA_KNEEMRI_POSITIVE", "any").lower()
-if KNEEMRI_POSITIVE_FROM not in {"any", "full"}:
-    raise ValueError(f"RSNA_KNEEMRI_POSITIVE must be 'any' or 'full', got {KNEEMRI_POSITIVE_FROM!r}")
-
-# ROI usage. roiDepth is typically only 2-6 slices out of 32, so a tight 3D
-# crop would throw away most of the volume and leave almost no slices.
-#   "none" -> whole slices, all Z (ignores the ROI entirely)
-#   "xy"   -> crop X/Y to the ROI plus a margin, keep ALL Z slices  [default]
-#   "xyz"  -> crop X/Y AND restrict Z to the ROI band plus a margin
-# "xy" is the default: it gives the encoder spatial focus on the ACL region
-# while still showing it a full through-plane stack, which is what the
-# downstream slot-attention model will always receive.
-KNEEMRI_ROI_MODE = os.environ.get("RSNA_KNEEMRI_ROI", "xy").lower()
-if KNEEMRI_ROI_MODE not in {"none", "xy", "xyz"}:
-    raise ValueError(f"RSNA_KNEEMRI_ROI must be 'none', 'xy' or 'xyz', got {KNEEMRI_ROI_MODE!r}")
-KNEEMRI_ROI_MARGIN = float(os.environ.get("RSNA_KNEEMRI_ROI_MARGIN", "0.6"))
-
-# KneeMRI volumes are sagittal. metadata.csv records no fat-saturation flag,
-# and the source describes them as proton-density-weighted sagittal series, so
-# SAG_FLUID_NOFS is the closest slot in our scheme. Override if you disagree.
-KNEEMRI_SLOT = os.environ.get("RSNA_KNEEMRI_SLOT", "SAG_FLUID_NOFS")
-
-# Which kneeLR value means a RIGHT knee. metadata.csv does not document this,
-# and getting it backwards would mirror/reverse the wrong half of the dataset.
-# Default 1=right; verify visually before trusting it (see the QA note in
-# load_kneemri_labels). Set RSNA_KNEEMRI_RIGHT=0 to swap.
-KNEEMRI_RIGHT_VALUE = int(os.environ.get("RSNA_KNEEMRI_RIGHT", "1"))
 
 def _kaggle_dataset_variants(slug):
     """
@@ -323,37 +239,14 @@ if IS_KAGGLE:
     print(f"  Labels CSV: {_found_labels}")
     PARSED_LABELS_CSV = _found_labels
 elif IS_SERVER:
-    PARSED_LABELS_CSV = Path(os.environ.get(
-        "RSNA_LABELS_CSV",
-        str(SERVER_ROOT / "AI-MODEL" / "final_labels_real_plus_generated.csv"),
-    ))
+    PARSED_LABELS_CSV = Path(
+        "/home/harleen_ece/rsna_knee_ai/AI-MODEL/final_labels_real_plus_generated.csv"
+    )
 else:
-    PARSED_LABELS_CSV = Path(os.environ.get(
-        "RSNA_LABELS_CSV",
-        r"C:\kabir\RSNA_Knee_AI\genuine_pipeline\DATA\output best\final_labels_real_plus_generated best.csv",
-    ))
+    PARSED_LABELS_CSV = Path(r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv")
 
-N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_TOTAL_STUDIES", "4349"))
-SAMPLE_SEED     = int(os.environ.get("RSNA_SAMPLE_SEED", "42"))
-STUDY_LIST_CSV = os.environ.get("RSNA_STUDY_LIST", "").strip()
-RUN_TEST_INFERENCE = os.environ.get("RSNA_RUN_TEST_INFERENCE", "1").lower() not in {"0", "false", "no"}
-# Test-time augmentation: average predictions over a few rotation-only
-# views (laterality-safe, see _tta_views/encode_images_tta near
-# encode_images). Off by default for train embeddings (unaffected by this
-# flag -- train always calls embed_slots with tta=False), on by default
-# for test embeddings and for pseudo-label scoring of weak studies.
-TEST_TTA = os.environ.get("RSNA_TEST_TTA", "1").lower() not in {"0", "false", "no"}
-# Guarded pseudo-labeling: use the fine-tuned Stage B model to refine weak
-# (parser-derived) labels where it is very confident (see
-# PSEUDO_LABEL_HIGH/LOW near apply_guarded_pseudo_labels). The 58 real
-# labels are never touched. Writes a separate CSV rather than overwriting
-# PARSED_LABELS_CSV in place, so this is opt-in to actually use.
-RUN_PSEUDO_LABELING = os.environ.get("RSNA_RUN_PSEUDO_LABELING", "1").lower() not in {"0", "false", "no"}
-# If set, refuse to run on CPU rather than silently falling back -- useful
-# on a shared server where a GPU allocation might not actually be live
-# (e.g. driver not loaded) and a silent CPU run would just be extremely
-# slow rather than failing loudly.
-REQUIRE_CUDA = os.environ.get("RSNA_REQUIRE_CUDA", "0").lower() not in {"0", "false", "no"}
+N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_STUDIES", 4407))  # FIX: was 4340; dataset has 4,407
+SAMPLE_SEED     = 42
 
 # ── constants ─────────────────────────────────────────────────────────────────
 TARGETS = [
@@ -366,152 +259,63 @@ SLOT_NAMES = [
     "SAG_FLUID_FS",
     "COR_FLUID_FS",
     "AX_FLUID_FS",
-    "SAG_FLUID_NOFS",
+    "AX_T1",          # FIX: was SAG_FLUID_NOFS -- 0 rows in train_series.csv
     "COR_T1",
     "SAG_T1",
 ]
 N_SLOT    = len(SLOT_NAMES)
 EMBED_DIM = 1152
 PROJ_DIM  = 256
-MAX_SLICES  = 12
-BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", "16"))
-SLICE_BAND  = (0.20, 0.80)
+# Raised to process more of each series. 12 slices from the middle 60%
+# used only ~31% of the DICOMs on disk. 20 slices from the middle 76%
+# roughly doubles coverage. Encoding time scales linearly with this.
+MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 20))
+BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", 16))
+SLICE_BAND  = (0.12, 0.88)
 LAT_OFFSET  = 20.0
 PRIOR_STRENGTH = 0.55
 
-# Stage A0: partial MedSigLIP fine-tuning (see finetune_medsiglip_stage_a0).
-# Set to False to skip it and keep the exact old frozen-MedSigLIP behavior.
-RUN_STAGE_A0_FINETUNE = os.environ.get("RSNA_RUN_STAGE_A0", "1").lower() not in {"0", "false", "no"}
-MEDSIGLIP_FINETUNE_BLOCKS = int(os.environ.get("RSNA_STAGE_A0_BLOCKS", "4"))
-MEDSIGLIP_FINETUNE_EPOCHS = int(os.environ.get("RSNA_STAGE_A0_EPOCHS", "3"))
-MEDSIGLIP_FINETUNE_MAX_IMAGES = int(os.environ.get("RSNA_STAGE_A0_MAX_IMAGES", "12"))
-
-# Set RSNA_FORCE_RESCAN=1 to ignore/delete the train-side DICOM index,
-# slots, and embedding-index caches at startup and rebuild them from
-# scratch this run (e.g. after changing N_TOTAL_STUDIES / the study
-# sample, or when you don't trust a cache is still valid). Does NOT
-# touch the fine-tuned MedSigLIP checkpoint or per-study embedding
-# .npy files themselves -- only the three index/cache files that
-# gate whether scan/slot/embed steps are skipped.
-FORCE_RESCAN = os.environ.get("RSNA_FORCE_RESCAN", "0").lower() not in {"0", "false", "no"}
-
-# ── FOLD SAFETY ───────────────────────────────────────────────────────────────
-# The 58 gold studies are the ONLY honest measurement surface in this pipeline.
-# Three separate stages used to train on them and then report an out-of-fold AUC
-# over the same 58, which makes that number optimistic by an unknown margin:
-#
-#   1. Stage A0 fine-tunes the MedSigLIP encoder itself on the gold labels
-#      (weight 3.0). Every embedding downstream is then contaminated, and no
-#      fold split can undo it because the encoder is shared across folds.
-#   2. Stage A trains the attention model on the gold labels, and its best fold
-#      is the initialization for every Stage B fold -- so each Stage B model
-#      starts from weights that already saw its own validation studies.
-#   3. Stage B picks the best EPOCH by the score on its own validation fold,
-#      then reports that same fold's predictions as out-of-fold.
-#
-# All three default to the fold-safe behaviour now. Set these to 0 to reproduce
-# the old numbers, but treat any AUC produced that way as unmeasured.
-EXCLUDE_GOLD_FROM_STAGE_A0 = os.environ.get("RSNA_A0_EXCLUDE_GOLD", "1").lower() not in {"0", "false", "no"}
-EXCLUDE_GOLD_FROM_STAGE_A  = os.environ.get("RSNA_A_EXCLUDE_GOLD",  "1").lower() not in {"0", "false", "no"}
-FOLD_SAFE_EPOCH_SELECT     = os.environ.get("RSNA_FOLD_SAFE_EPOCHS", "1").lower() not in {"0", "false", "no"}
-# Fraction of each Stage B training fold held out purely to choose the epoch,
-# so the outer validation fold is never looked at during training.
-INNER_SELECT_FRAC = float(os.environ.get("RSNA_INNER_SELECT_FRAC", "0.2"))
-
-# torch.compile is a pessimization here, not an optimization: forward() takes a
-# different number of slices for every study, and _run_sequence/_slice_positions
-# contain data-dependent Python loops, so Dynamo re-traces almost every step.
-# Off by default; set RSNA_COMPILE=1 to opt back in.
-USE_COMPILE = os.environ.get("RSNA_COMPILE", "0").lower() not in {"0", "false", "no"}
-
-# Per-study training is batch size 1, which makes gradients extremely noisy.
-# Accumulate before stepping instead -- same memory, much steadier updates.
-ACCUM_STEPS = max(1, int(os.environ.get("RSNA_ACCUM_STEPS", "8")))
-
-# ── 2.5D slice channels ───────────────────────────────────────────────────────
-# "2d"   : each slice replicated to R=G=B (previous behaviour, exactly).
-# "2.5d" : channels are (prev, current, next) physical neighbours, giving the
-#          encoder through-plane context for free -- no architecture change,
-#          no extra forward passes, same slice count.
-#
-# WARNING: switching this invalidates every cached embedding, because the
-# encoder input itself changes. The mode is folded into the cache tag below so
-# each mode keeps its own embedding set instead of silently reusing the other's.
-#
-# Risk worth knowing: MedSigLIP is a SigLIP ViT trained largely on medical
-# images where R=G=B. Genuinely different per-channel values are somewhat
-# out-of-distribution for it -- this may add real information or may break a
-# learned assumption. A/B it on one fold before committing to a full re-embed.
-SLICE_MODE = os.environ.get("RSNA_SLICE_MODE", "2d").lower().replace("_", ".")
-if SLICE_MODE not in {"2d", "2.5d"}:
-    raise ValueError(f"RSNA_SLICE_MODE must be '2d' or '2.5d', got {SLICE_MODE!r}")
-
-# ── Sequence model over slices ────────────────────────────────────────────────
-# "none" : attention pooling only (previous behaviour, exactly).
-# "gru"  : a bidirectional GRU runs over each slot's slice sequence before
-#          attention scores are computed, so the model can use slice ORDER
-#          ("two adjacent slices both show this" vs "one isolated slice").
-#
-# Cheap to test: operates on cached embeddings, so enabling it does NOT
-# require re-embedding. Only the NN checkpoints are invalidated.
-SEQ_MODEL  = os.environ.get("RSNA_SEQ_MODEL", "none").lower()
-if SEQ_MODEL not in {"none", "gru"}:
-    raise ValueError(f"RSNA_SEQ_MODEL must be 'none' or 'gru', got {SEQ_MODEL!r}")
-SEQ_HIDDEN = int(os.environ.get("RSNA_SEQ_HIDDEN", "128"))
-
-# Stage A0 (MedSigLIP fine-tuning) is the single most expensive step in the
-# pipeline -- hours, versus minutes for everything downstream. Changing
-# SLICE_MODE legitimately invalidates it, because the encoder was fine-tuned on
-# a different input representation than it would now be asked to embed.
-#
-# Set RSNA_KEEP_ENCODER=1 to override that and reuse the existing fine-tuned
-# encoder anyway. The trade-off is real but bounded: the encoder stays adapted
-# to knee MRI (which is most of the value it provides) while being slightly
-# mismatched to the new channel layout. Worth it when the alternative is
-# spending hours re-running Stage A0 just to test a downstream change.
-KEEP_FINETUNED_ENCODER = os.environ.get("RSNA_KEEP_ENCODER", "0").lower() not in {"0", "false", "no"}
-
-# ── Slice-position embedding ──────────────────────────────────────────────────
-# Attention scoring is order-agnostic: it scores each slice independently, so
-# slice 3 and slice 40 of the same series are interchangeable to it. A learned
-# position embedding restores that information, letting the model use WHERE in
-# the stack a slice sits (mid-stack slices carry most knee anatomy; the outer
-# ends are mostly padding/edge tissue) and giving the attention layer a basis
-# for "two ADJACENT slices both fire" vs "one isolated slice".
-#
-# Indexed by NORMALIZED position within each slot's own run, not raw index:
-# series have different slice counts, so raw index 5 means something different
-# in a 10-slice series than in a 40-slice one, while normalized 0.5 is
-# mid-stack in both.
-#
-# Cheap: operates on cached embeddings, so no re-embedding and no Stage A0
-# re-run. Only the NN checkpoints are invalidated.
-POS_EMB  = os.environ.get("RSNA_POS_EMB", "0").lower() not in {"0", "false", "no"}
-POS_BINS = int(os.environ.get("RSNA_POS_BINS", "32"))
-
+# Index 3 is now AX_T1 (axial T1), not SAG_FLUID_NOFS. Axial T1 shows the
+# patellofemoral joint and tibiofibular articulation well; it is poor for
+# the cruciates and the meniscal body, so the priors differ from the old
+# sagittal slot they replace.
 SLOT_PRIOR = {
-    "ACL":              [1, 0, 0, 1, 0, 1],
-    "MCL":              [0, 1, 0, 0, 1, 0],
-    "Medial Meniscus":  [1, 1, 0, 1, 1, 0],
-    "Lateral Meniscus": [1, 1, 0, 1, 1, 0],
-    "Medial OA":        [0, 1, 0, 0, 1, 0],
-    "Lateral OA":       [0, 1, 0, 0, 1, 0],
-    "PF OA":            [1, 0, 1, 0, 0, 1],
-    "Effusion":         [1, 0, 1, 0, 0, 0],
-    "Synovitis":        [1, 0, 1, 0, 0, 0],
-    "Baker's":          [1, 0, 0, 0, 0, 0],
-    "Contusion":        [1, 1, 0, 1, 1, 0],
-    "Fracture":         [1, 1, 1, 1, 1, 1],
+    #                   SAG_FS COR_FS AX_FS AX_T1 COR_T1 SAG_T1
+    "ACL":              [1,     0,     0,    0,    0,     1],
+    "MCL":              [0,     1,     0,    0,    1,     0],
+    "Medial Meniscus":  [1,     1,     0,    0,    1,     0],
+    "Lateral Meniscus": [1,     1,     0,    0,    1,     0],
+    "Medial OA":        [0,     1,     0,    0,    1,     0],
+    "Lateral OA":       [0,     1,     0,    0,    1,     0],
+    "PF OA":            [1,     0,     1,    1,    0,     1],
+    "Effusion":         [1,     0,     1,    1,    0,     0],
+    "Synovitis":        [1,     0,     1,    1,    0,     0],
+    "Baker's":          [1,     0,     1,    0,    0,     0],
+    "Contusion":        [1,     1,     0,    0,    1,     0],
+    "Fracture":         [1,     1,     1,    1,    1,     1],
 }
 
+# FIX: verified against train_series.csv (24,371 series). Only six
+# (plane, fluid, fat) combinations exist in the data. (Sagittal,1,0) has
+# ZERO rows -- the old SAG_FLUID_NOFS slot was permanently empty, a dead
+# input channel. Meanwhile (Axial,0,0) had 1,179 series in 857 studies
+# matching no slot at all, silently discarded. Swapping the two recovers
+# them and removes the dead channel.
 SLOTS = [
-    ("SAG_FLUID_FS",   "Sagittal", 1, 1),
-    ("COR_FLUID_FS",   "Coronal",  1, 1),
-    ("AX_FLUID_FS",    "Axial",    1, 1),
-    ("SAG_FLUID_NOFS", "Sagittal", 1, 0),
-    ("COR_T1",         "Coronal",  0, 0),
-    ("SAG_T1",         "Sagittal", 0, 0),
+    ("SAG_FLUID_FS", "Sagittal", 1, 1),
+    ("COR_FLUID_FS", "Coronal",  1, 1),
+    ("AX_FLUID_FS",  "Axial",    1, 1),
+    ("AX_T1",        "Axial",    0, 0),
+    ("COR_T1",       "Coronal",  0, 0),
+    ("SAG_T1",       "Sagittal", 0, 0),
 ]
+
+# Localizer / scout rejection. A 3-plane localizer often has MORE slices
+# than the diagnostic scan, so "most slices wins" actively selects junk.
+LOCALIZER_RE   = re.compile(r"loc|scout|survey|localiz|localis|3pl|surview|plan|smartbrain", re.I)
+MIN_SERIES_SLICES = 6      # below this, not a real diagnostic sequence
+MAX_SLICE_THICK   = 8.0    # mm; knee MRI is typically 3-4mm
+MIN_INPLANE_DIM   = 160    # px; scouts are low-res
 
 
 def seed_everything(s=42):
@@ -626,29 +430,70 @@ def scan_dicoms(series_root, series_csv, study_filter=None):
         paths = list(series_root.rglob("*.dcm"))
     print(f"  DCM files found: {len(paths)}")
 
+    # FIX: one header pass for everything. The old code read every header
+    # here, again in detect_laterality, and a third time in sort_slices.
+    # Geometry, quality fields and the image-centre X are all computed once
+    # and carried in the dataframe. Drops are counted by reason, not silent.
     def _read_header(p):
         try:
             ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
-            study  = str(getattr(ds, "StudyInstanceUID",  "") or "").strip()
-            series = str(getattr(ds, "SeriesInstanceUID", "") or "").strip()
-            sop    = str(getattr(ds, "SOPInstanceUID",    "") or "").strip()
-            inst   = getattr(ds, "InstanceNumber", None)
-            if inst is not None:
-                try: inst = int(inst)
-                except: inst = None
-            if study and series:
-                return dict(filepath=str(p), StudyInstanceUID=study,
-                            SeriesInstanceUID=series, SOPInstanceUID=sop,
-                            InstanceNumber=inst)
-        except Exception:
-            pass
-        return None
+        except Exception as e:
+            return ("ERR", type(e).__name__)
+        study  = str(getattr(ds, "StudyInstanceUID",  "") or "").strip()
+        series = str(getattr(ds, "SeriesInstanceUID", "") or "").strip()
+        if not (study and series):
+            return ("NOUID", None)
+        sop  = str(getattr(ds, "SOPInstanceUID", "") or "").strip()
+        inst = getattr(ds, "InstanceNumber", None)
+        try: inst = int(inst) if inst is not None else None
+        except Exception: inst = None
+
+        def _f(v, d=None):
+            try: return float(v)
+            except Exception: return d
+
+        ipp = getattr(ds, "ImagePositionPatient", None)
+        iop = getattr(ds, "ImageOrientationPatient", None)
+        ps  = getattr(ds, "PixelSpacing", None)
+        rws = _f(getattr(ds, "Rows", None)); cls = _f(getattr(ds, "Columns", None))
+        px = py = pz = cx = None
+        if ipp is not None and len(ipp) >= 3:
+            px, py, pz = _f(ipp[0]), _f(ipp[1]), _f(ipp[2])
+        # image-centre X in patient coords -> +X is patient LEFT
+        if None not in (px, rws, cls) and iop is not None and ps is not None:
+            try:
+                o = [float(x) for x in iop[:6]]; s = [float(x) for x in ps[:2]]
+                cx = px + o[0]*s[1]*cls/2.0 + o[3]*s[0]*rws/2.0
+            except Exception:
+                cx = None
+        return dict(filepath=str(p), StudyInstanceUID=study,
+                    SeriesInstanceUID=series, SOPInstanceUID=sop,
+                    InstanceNumber=inst,
+                    pos_x=px, pos_y=py, pos_z=pz, centre_x=cx,
+                    Rows=rws, Columns=cls,
+                    SliceThickness=_f(getattr(ds, "SliceThickness", None)),
+                    SeriesDescription=str(getattr(ds, "SeriesDescription", "") or ""))
 
     from concurrent.futures import ThreadPoolExecutor
     print(f"  Reading {len(paths)} DICOM headers (parallel)...")
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("RSNA_SCAN_WORKERS", 16))) as ex:
         results = list(ex.map(_read_header, paths))
-    rows = [r for r in results if r is not None]
+
+    rows, n_err, n_nouid, err_kinds = [], 0, 0, {}
+    for r in results:
+        if isinstance(r, dict):
+            rows.append(r)
+        elif r[0] == "ERR":
+            n_err += 1; err_kinds[r[1]] = err_kinds.get(r[1], 0) + 1
+        else:
+            n_nouid += 1
+    if n_err or n_nouid:
+        print(f"  [DROP] unreadable={n_err} missing-UID={n_nouid} "
+              f"of {len(paths)} ({100.0*(n_err+n_nouid)/max(len(paths),1):.2f}%)")
+        if err_kinds:
+            print(f"  [DROP] error kinds: {err_kinds}")
+    else:
+        print(f"  [DROP] none -- all {len(paths)} headers read cleanly")
 
     df = pd.DataFrame(rows)
     meta = pd.read_csv(series_csv, dtype=str)
@@ -657,18 +502,36 @@ def scan_dicoms(series_root, series_csv, study_filter=None):
 
     merged = df.merge(meta, on=["StudyInstanceUID", "SeriesInstanceUID"], how="left")
 
-    # fallback: infer plane from IOP for unmatched
+    # FIX: the old fallback set Fluid_Sensitive=0 and Fat_Suppression=0 for
+    # any series absent from the CSV. A fat-sat T2 landing there was shoved
+    # into a T1 slot with no warning. Now the guess is flagged so it can be
+    # counted, and how many series hit this path is printed.
+    merged["meta_guessed"] = False
     unmatched = merged["Anatomical_Plane"].isna()
+    n_unmatched_series = merged.loc[unmatched, "SeriesInstanceUID"].nunique()
     if unmatched.sum() > 0:
-        for idx in merged[unmatched].index:
+        for sid, sub in merged[unmatched].groupby("SeriesInstanceUID"):
+            idx0 = sub.index[0]
+            plane = "Unknown"
             try:
-                ds = pydicom.dcmread(merged.loc[idx, "filepath"],
+                ds = pydicom.dcmread(merged.loc[idx0, "filepath"],
                                      stop_before_pixels=True, force=True)
-                merged.loc[idx, "Anatomical_Plane"] = _plane_from_iop(ds)
-                merged.loc[idx, "Fluid_Sensitive"]  = 0
-                merged.loc[idx, "Fat_Suppression"]  = 0
+                plane = _plane_from_iop(ds)
             except Exception:
                 pass
+            merged.loc[sub.index, "Anatomical_Plane"] = plane
+            merged.loc[sub.index, "Fluid_Sensitive"]  = 0
+            merged.loc[sub.index, "Fat_Suppression"]  = 0
+            merged.loc[sub.index, "meta_guessed"]     = True
+        print(f"  [WARN] {n_unmatched_series} series absent from series CSV -- "
+              f"plane inferred from geometry, fluid/fat GUESSED as 0/0")
+
+    n_unknown = merged.loc[merged["Anatomical_Plane"].isin(["Unknown"]) |
+                           merged["Anatomical_Plane"].isna(),
+                           "SeriesInstanceUID"].nunique()
+    if n_unknown:
+        print(f"  [WARN] {n_unknown} series have no usable plane -- "
+              f"they will match no slot and be dropped")
 
     print(f"  Studies: {merged['StudyInstanceUID'].nunique()}")
     print(f"  Series : {merged['SeriesInstanceUID'].nunique()}")
@@ -693,61 +556,135 @@ def _plane_from_iop(ds):
 # STEP 2 — BUILD SLOTS + LATERALITY
 # ══════════════════════════════════════════════════════════════════════════════
 def detect_laterality(dicom_df):
-    study_cx = {}
-    for _, r in dicom_df.iterrows():
-        try:
-            ds  = pydicom.dcmread(r["filepath"], stop_before_pixels=True, force=True)
-            ipp = getattr(ds, "ImagePositionPatient", None)
-            iop = getattr(ds, "ImageOrientationPatient", None)
-            ps  = getattr(ds, "PixelSpacing", None)
-            rows = getattr(ds, "Rows", None)
-            cols = getattr(ds, "Columns", None)
-            if ipp is None or iop is None or ps is None: continue
-            ipp = np.array([float(x) for x in ipp[:3]])
-            iop = np.array([float(x) for x in iop[:6]])
-            ps  = np.array([float(x) for x in ps[:2]])
-            cx  = ipp[0] + iop[0]*ps[1]*float(cols)/2 + iop[3]*ps[0]*float(rows)/2
-            study_cx.setdefault(r["StudyInstanceUID"], []).append(float(cx))
-        except Exception:
-            pass
+    """
+    FIX: centre_x is now computed once inside scan_dicoms and carried in the
+    dataframe. The old version re-opened every DICOM header from disk and
+    iterated with iterrows() -- minutes wasted on the 58-study set, far more
+    on the full 4,407. This is a groupby over a column already in memory.
+    """
+    if "centre_x" not in dicom_df.columns:
+        raise RuntimeError("dicom_df has no centre_x column -- stale cached "
+                           "train_dicom_index.csv. Delete it and re-scan.")
+    cx = pd.to_numeric(dicom_df["centre_x"], errors="coerce")
+    med = cx.groupby(dicom_df["StudyInstanceUID"]).median()
+
     result = {}
-    for su, xs in study_cx.items():
-        m = float(np.median(xs))
-        result[su] = "R" if m < -LAT_OFFSET else ("L" if m > LAT_OFFSET else None)
+    for su, m in med.items():
+        if pd.isna(m):
+            result[su] = None
+        else:
+            result[su] = "R" if m < -LAT_OFFSET else ("L" if m > LAT_OFFSET else None)
+
+    vals = list(result.values())
+    print(f"  Laterality: L={vals.count('L')} R={vals.count('R')} "
+          f"unknown={vals.count(None)} of {len(vals)} studies")
     return result
 
 
-def assign_slots(dicom_df):
+def _series_quality(series_df):
+    """
+    Rank a series as diagnostic (1) or junk (0), plus a tiebreak score.
+
+    "Most slices wins" is not a quality measure: a 3-plane localizer often
+    carries MORE slices than the diagnostic scan it beats. Flag the obvious
+    junk, then break remaining ties on slice count.
+    """
+    desc  = series_df.get("SeriesDescription", pd.Series("", index=series_df.index)).fillna("").astype(str)
+    thick = pd.to_numeric(series_df.get("SliceThickness"), errors="coerce")
+    rows_ = pd.to_numeric(series_df.get("Rows"),    errors="coerce")
+    cols_ = pd.to_numeric(series_df.get("Columns"), errors="coerce")
+    nsl   = pd.to_numeric(series_df["n_slices"],    errors="coerce").fillna(0)
+
+    is_loc   = desc.str.contains(LOCALIZER_RE, na=False)
+    too_thick = thick.notna() & (thick > MAX_SLICE_THICK)
+    too_few   = nsl < MIN_SERIES_SLICES
+    too_small = (rows_.notna() & (rows_ < MIN_INPLANE_DIM)) | \
+                (cols_.notna() & (cols_ < MIN_INPLANE_DIM))
+    # a "series" whose slices span more than one plane is a 3-plane scout
+    multi_plane = series_df.get("n_planes", pd.Series(1, index=series_df.index)) > 1
+
+    junk = is_loc | too_thick | too_few | too_small | multi_plane
+    return (~junk).astype(int), {
+        "localizer_name": int(is_loc.sum()), "too_thick": int(too_thick.sum()),
+        "too_few_slices": int(too_few.sum()), "low_res": int(too_small.sum()),
+        "multi_plane": int(multi_plane.sum()),
+    }
+
+
+def assign_slots(dicom_df, reject_junk=True, verbose=True):
     slice_counts = dicom_df.groupby("SeriesInstanceUID").size().to_dict()
+    # how many distinct planes appear within one series -> scout detector
+    n_planes = (dicom_df.groupby("SeriesInstanceUID")["Anatomical_Plane"]
+                .nunique().to_dict())
+
     series_df = (dicom_df.groupby(["StudyInstanceUID", "SeriesInstanceUID"])
                  .first().reset_index())
     series_df["n_slices"] = series_df["SeriesInstanceUID"].map(slice_counts)
-    rows = []
+    series_df["n_planes"] = series_df["SeriesInstanceUID"].map(n_planes).fillna(1)
+
+    quality, junk_counts = _series_quality(series_df)
+    series_df["quality"] = quality if reject_junk else 1
+    if verbose:
+        n_junk = int((series_df["quality"] == 0).sum())
+        print(f"  Quality filter: {n_junk}/{len(series_df)} series flagged as junk "
+              f"({100.0*n_junk/max(len(series_df),1):.1f}%) -> {junk_counts}")
+
+    rows, n_orphan = [], 0
     for study, grp in series_df.groupby("StudyInstanceUID"):
+        claimed = set()
         for slot_name, plane, fluid, fat in SLOTS:
             mask = ((grp["Anatomical_Plane"] == plane) &
                     (grp["Fluid_Sensitive"].fillna(0).astype(int) == fluid) &
                     (grp["Fat_Suppression"].fillna(0).astype(int) == fat))
-            cands = grp[mask].sort_values("n_slices", ascending=False)
+            # FIX: diagnostic series outrank junk; slice count only breaks ties
+            cands = grp[mask].sort_values(["quality", "n_slices"], ascending=[False, False])
             if len(cands) == 0:
                 rows.append({"StudyInstanceUID": study, "SeriesInstanceUID": "",
-                             "slot_name": slot_name, "n_slices": 0, "presence_mask": 0})
+                             "slot_name": slot_name,
+                             "Anatomical_Plane": plane,   # FIX: carry the plane
+                             "n_slices": 0, "presence_mask": 0,
+                             "alt_series": ""})
             else:
                 best = cands.iloc[0]
+                claimed.update(cands["SeriesInstanceUID"].tolist())
+                # FIX: runners-up are no longer discarded -- they are recorded
+                # so embed_slots can pool them into the same slice budget.
+                alts = [s for s in cands["SeriesInstanceUID"].tolist()[1:]]
                 rows.append({"StudyInstanceUID": study,
                              "SeriesInstanceUID": best["SeriesInstanceUID"],
                              "slot_name": slot_name,
+                             "Anatomical_Plane": str(best["Anatomical_Plane"]),
                              "n_slices": int(best["n_slices"]),
-                             "presence_mask": 1})
+                             "presence_mask": 1,
+                             "alt_series": "|".join(alts)})
+        n_orphan += int((~grp["SeriesInstanceUID"].isin(claimed)).sum())
+
+    if verbose and n_orphan:
+        print(f"  [WARN] {n_orphan} series matched no slot in any study "
+              f"({100.0*n_orphan/max(len(series_df),1):.1f}%)")
     return pd.DataFrame(rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — MEDSIGLIP EMBEDDINGS
 # ══════════════════════════════════════════════════════════════════════════════
-def sort_slices(paths):
+def sort_slices(paths, pos_lookup=None):
+    """
+    FIX: pos_lookup maps filepath -> (x, y, z, InstanceNumber), built once in
+    scan_dicoms. The old code re-read every DICOM header here -- a third full
+    pass over the corpus after scan_dicoms and detect_laterality. Falls back
+    to reading from disk only if the lookup is missing an entry.
+    """
     meta = []
     for p in paths:
+        rec = pos_lookup.get(str(p)) if pos_lookup else None
+        if rec is not None:
+            x, y, z, inst = rec
+            pos = None
+            if x is not None and np.isfinite([x, y, z]).all():
+                pos = np.array([x, y, z], dtype=float)
+            meta.append((p, pos, inst))
+            continue
         try:
             ds   = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
             ipp  = getattr(ds, "ImagePositionPatient", None)
@@ -773,11 +710,22 @@ def sort_slices(paths):
 
 
 def select_band(paths):
-    n  = len(paths)
+    """
+    FIX: the old version always cut the outer 40%, even when there were only
+    10 slices to begin with -- leaving 6 and throwing away usable anatomy for
+    no gain. Banding exists to drop edge slices when there is a surplus; if
+    the series already has no surplus, keep all of it.
+    """
+    n = len(paths)
+    if n <= MAX_SLICES:
+        return paths                      # no surplus -- keep everything
     lo = int(np.floor(n * SLICE_BAND[0]))
     hi = int(np.ceil(n  * SLICE_BAND[1]))
     band = paths[lo:hi]
-    if len(band) <= MAX_SLICES: return band
+    if len(band) < MAX_SLICES:            # banding overshot -- widen back out
+        band = paths
+    if len(band) <= MAX_SLICES:
+        return band
     idx = np.unique(np.round(np.linspace(0, len(band)-1, MAX_SLICES)).astype(int))
     return [band[i] for i in idx]
 
@@ -789,247 +737,61 @@ def normalise_laterality(imgs, plane, lat):
     return imgs[::-1]
 
 
-def dicom_to_pil(path):
+def dicom_to_array(path):
+    """Raw rescaled float array for one slice, polarity corrected."""
     ds  = pydicom.dcmread(str(path))
     arr = ds.pixel_array.astype(np.float32)
     if str(getattr(ds, "PhotometricInterpretation", "")).strip() == "MONOCHROME1":
         arr = arr.max() - arr
     slope     = float(getattr(ds, "RescaleSlope",     1.0) or 1.0)
     intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
-    arr = arr * slope + intercept
-    lo, hi = np.percentile(arr, [1, 99])
-    if hi <= lo: lo, hi = float(arr.min()), float(arr.max())
-    if hi <= lo: arr = np.zeros_like(arr, dtype=np.uint8)
-    else:
-        arr = np.clip((arr - lo) / (hi - lo), 0, 1)
-        arr = (arr * 255).astype(np.uint8)
-    return Image.fromarray(arr).convert("RGB")
+    return arr * slope + intercept
 
 
-def dicom_to_pil_gray(path):
-    """Identical decode to dicom_to_pil(), but returns a single-channel 'L'
-    image instead of a 3-channel RGB one.
-
-    Exists so build_slice_images() can compose channels itself. dicom_to_pil()
-    is deliberately left unchanged (still RGB) because other call sites depend
-    on its current contract.
+def arrays_to_pils(arrays):
     """
-    ds  = pydicom.dcmread(str(path))
-    arr = ds.pixel_array.astype(np.float32)
-    if str(getattr(ds, "PhotometricInterpretation", "")).strip() == "MONOCHROME1":
-        arr = arr.max() - arr
-    slope     = float(getattr(ds, "RescaleSlope",     1.0) or 1.0)
-    intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
-    arr = arr * slope + intercept
-    lo, hi = np.percentile(arr, [1, 99])
-    if hi <= lo: lo, hi = float(arr.min()), float(arr.max())
-    if hi <= lo: arr = np.zeros_like(arr, dtype=np.uint8)
-    else:
-        arr = np.clip((arr - lo) / (hi - lo), 0, 1)
-        arr = (arr * 255).astype(np.uint8)
-    return Image.fromarray(arr)  # mode 'L'
+    FIX: window once per SERIES, not per slice.
 
-
-def build_slice_images(paths):
-    """Decode an ordered list of DICOM paths into encoder-ready RGB images.
-
-    SLICE_MODE == "2d"   : each slice replicated across R/G/B.
-                           Byte-identical to the previous dicom_to_pil() path.
-    SLICE_MODE == "2.5d" : channels are (previous, current, next) physical
-                           neighbours, so each encoded image carries
-                           through-plane context. Boundary slices replicate
-                           their nearest valid neighbour rather than padding
-                           with black, which would inject a fake edge.
-
-    `paths` MUST already be physically ordered (sort_slices) — 2.5D is only
-    meaningful if index i-1/i+1 are true anatomical neighbours. Slices that
-    fail to decode are dropped, and neighbours are taken from the surviving
-    list, so a mid-series decode failure shifts context by one slice rather
-    than aborting the series.
-
-    Note: neighbours come from the already-band-selected list, so when
-    select_band() decimates a long series, "previous" may be several physical
-    slices away. This is intentional (keeps slice count and memory identical to
-    2D mode) but means 2.5D context is coarser on long series.
+    The old dicom_to_pil computed 1st/99th percentiles on each slice
+    independently, so a slice full of bright effusion was rescaled until the
+    fluid looked like ordinary tissue in a neighbouring slice. Relative
+    brightness across the series -- which is exactly the signal for Effusion
+    and Synovitis -- was destroyed. Percentiles are now taken over the whole
+    stack and one window is applied to every slice.
     """
-    grays = []
-    for p in paths:
-        try:
-            grays.append(dicom_to_pil_gray(p))
-        except Exception:
-            pass
-    if not grays:
+    if not arrays:
         return []
-
-    if SLICE_MODE != "2.5d":
-        return [g.convert("RGB") for g in grays]
-
-    # All slices in a series should share dimensions; if one doesn't, resize it
-    # to the modal size rather than crashing the whole series on Image.merge.
-    ref_size = grays[len(grays) // 2].size
-    grays = [g if g.size == ref_size else g.resize(ref_size, Image.BILINEAR)
-             for g in grays]
-
-    n = len(grays)
+    flat = np.concatenate([a.ravel() for a in arrays])
+    lo, hi = np.percentile(flat, [1, 99])
+    if hi <= lo:
+        lo, hi = float(flat.min()), float(flat.max())
     out = []
-    for i in range(n):
-        prev_img = grays[i - 1] if i > 0     else grays[i]
-        next_img = grays[i + 1] if i < n - 1 else grays[i]
-        out.append(Image.merge("RGB", (prev_img, grays[i], next_img)))
+    for a in arrays:
+        if hi <= lo:
+            u8 = np.zeros(a.shape, dtype=np.uint8)
+        else:
+            u8 = (np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
+        out.append(Image.fromarray(u8).convert("RGB"))
     return out
 
 
-def unfreeze_medsiglip_vision(model, train_last_blocks=4):
-    """Lock every MedSigLIP parameter, then deliberately re-unlock only the
-    last N vision-tower blocks (plus the final norm layer).
-
-    Early transformer blocks learn generic visual patterns that transfer
-    fine as-is; late blocks are where task-specific adaptation happens.
-    With only 58 gold-labeled studies, unlocking the WHOLE model risks
-    catastrophically overwriting MedSigLIP's general knowledge while trying
-    to fit 58 examples. Unlocking just the tail is the standard, safer way
-    to adapt a large pretrained model to a small labeled set.
-    """
-    vision = model.vision_model
-    for p in vision.parameters():
-        p.requires_grad = False
-    blocks = vision.encoder.layers
-    for block in blocks[-train_last_blocks:]:
-        for p in block.parameters():
-            p.requires_grad = True
-    if hasattr(vision, "post_layernorm"):
-        for p in vision.post_layernorm.parameters():
-            p.requires_grad = True
-    n_trainable = sum(p.numel() for p in vision.parameters() if p.requires_grad)
-    n_total = sum(p.numel() for p in vision.parameters())
-    print(f"  MedSigLIP vision tower: {n_trainable:,}/{n_total:,} params trainable "
-          f"(last {train_last_blocks} blocks + post_layernorm)")
-    return model
+def dicom_to_pil(path):
+    """Single-slice path, kept for callers outside embed_slots."""
+    return arrays_to_pils([dicom_to_array(path)])[0]
 
 
-def load_medsiglip(finetuned_path=None):
-    """Single loader used at BOTH train-embed and test-embed time.
-
-    If a fine-tuned vision-tower checkpoint exists (produced by
-    finetune_medsiglip_stage_a0 below), it is loaded here automatically.
-    This is deliberate: train and test embeddings must come from the exact
-    same weights, or you get a silent train/test distribution mismatch that
-    tanks accuracy with no error thrown. Having ONE function that every
-    embedding call site goes through -- rather than two call sites each
-    deciding independently whether to load fine-tuned weights -- removes
-    that failure mode by construction instead of relying on remembering to
-    keep two code paths in sync.
-    """
+def load_medsiglip():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  Loading MedSigLIP | device={device}")
     processor = AutoProcessor.from_pretrained(str(MODEL_PATH))
     model = AutoModel.from_pretrained(
         str(MODEL_PATH),
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    ).to(device)
-
-    if finetuned_path is None:
-        finetuned_path = MODEL_DIR / "medsiglip_finetuned_vision.pt"
-    finetuned_path = Path(finetuned_path)
-    if finetuned_path.exists():
-        print(f"  Found fine-tuned vision tower at {finetuned_path} — loading it "
-              f"(both train and test embeddings will use these weights)")
-        ckpt = torch.load(finetuned_path, map_location=device, weights_only=True)
-        missing, unexpected = model.vision_model.load_state_dict(ckpt["vision_state_dict"], strict=False)
-        if missing or unexpected:
-            raise RuntimeError(
-                f"medsiglip_finetuned_vision.pt does not match this MedSigLIP build: "
-                f"missing={len(missing)} unexpected={len(unexpected)}. Do not silently "
-                f"proceed on a partial/mismatched load -- re-run Stage A0 fine-tuning."
-            )
-    else:
-        print("  No fine-tuned checkpoint found — using stock MedSigLIP weights.")
-
-    model = model.eval()
+    ).to(device).eval()
     return processor, model, device
 
 
-def encoder_fingerprint():
-    """Identifies which encoder weights are currently active (stock vs a
-    specific fine-tuned checkpoint's mtime+size), so cached embeddings can
-    be auto-invalidated if the encoder changes between runs instead of
-    silently mixing embeddings produced by two different encoders.
-    """
-    p = MODEL_DIR / "medsiglip_finetuned_vision.pt"
-    if p.exists():
-        stat = p.stat()
-        return f"finetuned:{stat.st_mtime_ns}:{stat.st_size}"
-    return "stock"
-
-
-def check_embedding_cache_freshness(work_dir):
-    """Invalidate every artifact derived from an outdated vision encoder.
-
-    DICOM scan and slot-assignment caches are intentionally preserved: they
-    depend only on the source DICOM/metadata, not on encoder weights. Raw
-    per-series embeddings, neural/XGBoost checkpoints and OOF predictions
-    must all be rebuilt together, otherwise a new encoder can silently reuse
-    old features or models trained on those old features.
-    """
-    import shutil
-
-    work_dir = Path(work_dir)
-    fp_path = work_dir / "embedding_encoder_fingerprint.txt"
-    current = encoder_fingerprint()
-    previous = fp_path.read_text().strip() if fp_path.exists() else None
-    if previous == current:
-        return
-
-    removed = []
-
-    # Per-study train/test .pt files are checked individually by embed_slots,
-    # so removing only train_embedding_index.csv is not sufficient.
-    # BUGFIX: embeddings live under CACHE_DIR (EMB_DIR), which is only equal to
-    # WORK_DIR when RSNA_CACHE_DIR is unset. With a separate cache dir this
-    # deleted an empty/irrelevant WORK_DIR/embeddings and left the real, stale
-    # embeddings in place -- silently mixing two encoders' features.
-    embedding_dir = EMB_DIR
-    if embedding_dir.exists():
-        n_embedding_files = sum(1 for p in embedding_dir.rglob("*") if p.is_file())
-        shutil.rmtree(embedding_dir)
-        embedding_dir.mkdir(parents=True, exist_ok=True)
-        removed.append(f"embeddings/ ({n_embedding_files} files)")
-
-    stale_files = [
-        MODEL_DIR / "stage_a_pretrained.pt",
-        MODEL_DIR / "xgb_stage_a.pkl",
-        MODEL_DIR / "oof_predictions.csv",
-    ]
-    # Match every embedding-index variant, not just the legacy untagged
-    # name -- train_embedding_index_n1000.csv, _n4349.csv, etc. (see
-    # _study_set_tag) all list presence_mask=1 pointing at the .pt files
-    # just deleted above. Missing one here leaves a stale index that still
-    # claims files exist after they were just wiped, causing a flood of
-    # "[Errno 2] No such file or directory" the moment presence_mask is
-    # read correctly (it silently never surfaced before that was fixed).
-    stale_files.extend(work_dir.glob("train_embedding_index*.csv"))
-    stale_files.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
-    stale_files.extend(MODEL_DIR.glob("fold_*.pt"))
-    stale_files.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
-
-    # De-duplicate paths while preserving deterministic log order.
-    for stale_path in sorted(set(stale_files), key=lambda p: str(p)):
-        if stale_path.exists():
-            stale_path.unlink()
-            removed.append(str(stale_path.relative_to(work_dir)))
-
-    old_name = previous if previous is not None else "unrecorded/legacy cache"
-    if removed:
-        print(f"  [CACHE] Encoder changed ({old_name} -> {current}) — invalidated "
-              f"{len(removed)} downstream cache group(s): {removed}")
-    else:
-        print(f"  [CACHE] Recording encoder fingerprint: {current} "
-              f"(no downstream cache artifacts existed)")
-
-    # Write this only after every stale artifact has been removed successfully.
-    fp_path.write_text(current)
-
-
+@torch.inference_mode()
 def encode_images(images, processor, model, device):
     feats = []
     for i in range(0, len(images), BATCH_SIZE):
@@ -1047,57 +809,36 @@ def encode_images(images, processor, model, device):
     return torch.cat(feats, dim=0)
 
 
-# TTA view transforms for embed_slots(). Every view here must be a
-# transform that does NOT change which anatomical side/structure is being
-# looked at -- knees are not left-right symmetric the way brains are, so
-# a naive horizontal flip (valid for e.g. intracranial-aneurysm TTA) would
-# risk teaching the model that a right-knee ACL finding is a left-knee one.
-# Images going into this function have ALREADY been through
-# normalise_laterality(), i.e. they are already canonicalized to a single
-# consistent side -- so we only apply views that preserve that
-# canonicalization: small rotations (do not touch left/right meaning) and
-# a small in-plane zoom. We deliberately do NOT include FLIP_LEFT_RIGHT or
-# FLIP_TOP_BOTTOM here, since either can invert laterality or
-# superior/inferior anatomical meaning depending on plane.
-TTA_ROTATIONS_DEG = (0, 3, -3)
-
-
-def _tta_views(img):
-    """Yield laterality-safe augmented copies of a single PIL image."""
-    for deg in TTA_ROTATIONS_DEG:
-        yield img.rotate(deg, resample=Image.BILINEAR, fillcolor=0) if deg else img
-
-
-def encode_images_tta(images, processor, model, device, tta=False):
-    """
-    Same as encode_images(), optionally averaging predictions over a few
-    laterality-safe views per image (rotations only -- see _tta_views).
-    tta=False reproduces encode_images() exactly (used for training
-    embeddings, which should stay single-pass/deterministic and cheap).
-    tta=True is intended for test-time and pseudo-label-scoring embeddings.
-    """
-    if not tta:
-        return encode_images(images, processor, model, device)
-
-    per_view_feats = []
-    for deg in TTA_ROTATIONS_DEG:
-        view_images = [img.rotate(deg, resample=Image.BILINEAR, fillcolor=0) if deg else img
-                       for img in images]
-        per_view_feats.append(encode_images(view_images, processor, model, device))
-    # average across views, then re-normalize (mean of unit vectors isn't
-    # itself unit-norm)
-    stacked = torch.stack(per_view_feats, dim=0)          # [n_views, N, D]
-    averaged = stacked.mean(dim=0)                         # [N, D]
-    return F.normalize(averaged, dim=-1)
-
-
 def embed_slots(slots_df, dicom_df, processor, model, device,
-                lat_map, out_dir, force=False, tta=False):
+                lat_map, out_dir, force=False, use_alts=True):
     series_to_files = (dicom_df.groupby("SeriesInstanceUID")["filepath"]
                        .apply(list).to_dict())
+
+    # FIX: position lookup so sort_slices never re-reads headers from disk
+    pos_lookup = {}
+    if {"pos_x", "pos_y", "pos_z"} <= set(dicom_df.columns):
+        _sub = dicom_df[["filepath", "pos_x", "pos_y", "pos_z", "InstanceNumber"]]
+        for fp, x, y, z, inst in _sub.itertuples(index=False):
+            try: inst = int(inst) if pd.notna(inst) else None
+            except Exception: inst = None
+            pos_lookup[str(fp)] = (
+                float(x) if pd.notna(x) else None,
+                float(y) if pd.notna(y) else None,
+                float(z) if pd.notna(z) else None, inst)
+
+    # FIX: the old code read Anatomical_Plane off slots_df, but assign_slots
+    # never wrote that column -- so plane was ALWAYS "Unknown" and every right
+    # knee fell through to the sagittal branch of normalise_laterality. Coronal
+    # and axial right knees were never mirrored, leaving medial/lateral swapped
+    # for four of the twelve targets. assign_slots now emits the column; this
+    # is a hard check so the bug cannot come back silently.
+    if "Anatomical_Plane" not in slots_df.columns:
+        raise RuntimeError("slots_df has no Anatomical_Plane column -- stale "
+                           "train_slots_cache.pkl. Delete it and rebuild slots.")
+
     present = slots_df[slots_df["presence_mask"] == 1].copy()
     index_rows = []
-    done = failed = skipped = 0
+    done = failed = skipped = n_pooled = 0
 
     for _, row in tqdm(present.iterrows(), total=len(present), desc="  Embedding"):
         study  = str(row["StudyInstanceUID"])
@@ -1114,27 +855,64 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
                                 "presence_mask": 1})
             continue
 
-        paths = [Path(p) for p in series_to_files.get(series, []) if Path(p).is_file()]
-        paths = sort_slices(paths)
-        paths = select_band(paths)
+        # FIX: runners-up for this slot are no longer thrown away. The slice
+        # budget is shared between the winning series and its alternates, so
+        # the same MAX_SLICES images are drawn from more of the study. Costs
+        # nothing extra to encode.
+        srcs = [series]
+        if use_alts:
+            alt = str(row.get("alt_series", "") or "")
+            srcs += [s for s in alt.split("|") if s]
 
-        # 2D or 2.5D depending on SLICE_MODE; sort_slices() above guarantees
-        # the physical ordering that makes neighbour-stacking meaningful.
-        images = build_slice_images(paths)
+        per_src = max(1, MAX_SLICES // max(len(srcs), 1))
+        paths = []
+        for si, s in enumerate(srcs):
+            sp = [Path(p) for p in series_to_files.get(s, []) if Path(p).is_file()]
+            if not sp:
+                continue
+            sp = sort_slices(sp, pos_lookup=pos_lookup)
+            budget = MAX_SLICES if len(srcs) == 1 else per_src
+            n_sp = len(sp)
+            if n_sp > budget:
+                lo = int(np.floor(n_sp * SLICE_BAND[0]))
+                hi = int(np.ceil(n_sp  * SLICE_BAND[1]))
+                band = sp[lo:hi] if (hi - lo) >= budget else sp
+                idx = np.unique(np.round(np.linspace(0, len(band)-1, budget)).astype(int))
+                sp = [band[i] for i in idx]
+            paths.extend(sp)
+        if len(srcs) > 1 and len(paths) > len(series_to_files.get(series, [])):
+            n_pooled += 1
+        if not paths:
+            paths = sort_slices(
+                [Path(p) for p in series_to_files.get(series, []) if Path(p).is_file()],
+                pos_lookup=pos_lookup)
+            paths = select_band(paths)
+
+        # FIX: window per series, not per slice (see arrays_to_pils)
+        arrays = []
+        for p in paths:
+            try: arrays.append(dicom_to_array(p))
+            except Exception: pass
+        images = arrays_to_pils(arrays)
 
         if not images:
             failed += 1
+            # FIX: still record the slot so the embedding index and the slot
+            # table cannot silently disagree about what is present.
+            index_rows.append({"StudyInstanceUID": study, "SeriesInstanceUID": series,
+                               "slot_name": slot, "embedding_file": "",
+                               "presence_mask": 0})
             continue
 
         images = normalise_laterality(images, plane, lat)
 
         try:
-            feats = encode_images_tta(images, processor, model, device, tta=tta)
+            feats = encode_images(images, processor, model, device)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"embeddings": feats, "slot_name": slot,
                         "study_uid": study, "series_uid": series,
                         "laterality": lat, "plane": plane,
-                        "n_slices": len(images), "tta": tta}, out_path)
+                        "n_slices": len(images)}, out_path)
             done += 1
             index_rows.append({"StudyInstanceUID": study, "SeriesInstanceUID": series,
                                 "slot_name": slot, "embedding_file": str(out_path),
@@ -1142,184 +920,18 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
         except Exception as e:
             print(f"\n  [WARN] {study[:20]}/{slot}: {e}")
             failed += 1
+            index_rows.append({"StudyInstanceUID": study, "SeriesInstanceUID": series,
+                               "slot_name": slot, "embedding_file": "",
+                               "presence_mask": 0})
 
-    print(f"  Embedded={done} Skipped={skipped} Failed={failed}")
+    print(f"  Embedded={done} Skipped={skipped} Failed={failed} "
+          f"SlotsPooledFromMultipleSeries={n_pooled}")
     return pd.DataFrame(index_rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — MODEL
 # ══════════════════════════════════════════════════════════════════════════════
-def _study_images_for_finetune(study, train_slots, train_dcm, lat_map):
-    """All slices across all present slots for one study, decoded to PIL,
-    laterality-normalized -- one flat list, no per-slot separation.
-
-    Deliberate simplification versus embed_slots(): this fine-tuning stage
-    only needs the encoder itself to adapt, via ONE pooled embedding per
-    study feeding a tiny linear head. The full slot-attention structure is
-    preserved downstream, once Stage A/B re-consume the regenerated
-    per-slot cached embeddings -- this function's only job is to give the
-    unfrozen vision blocks real gradient signal, cheaply.
-    """
-    series_to_files = (train_dcm.groupby("SeriesInstanceUID")["filepath"]
-                       .apply(list).to_dict())
-    rows = train_slots[(train_slots["StudyInstanceUID"] == study) &
-                        (train_slots["presence_mask"] == 1)]
-    lat = lat_map.get(study)
-    images = []
-    for _, row in rows.iterrows():
-        series = str(row["SeriesInstanceUID"])
-        plane = str(row.get("Anatomical_Plane", "Unknown"))
-        paths = [Path(p) for p in series_to_files.get(series, []) if Path(p).is_file()]
-        paths = select_band(sort_slices(paths))
-        # Same builder as embed_slots(), so Stage A0 fine-tunes the encoder on
-        # exactly the representation it will later be asked to embed. If these
-        # two diverged (e.g. fine-tune on 2D, embed on 2.5D) the encoder would
-        # be adapted to inputs it never actually sees at embedding time.
-        slot_imgs = build_slice_images(paths)
-        images.extend(normalise_laterality(slot_imgs, plane, lat))
-    return images
-
-
-def finetune_medsiglip_stage_a0(pretrain_ids, lbl, train_dcm, train_slots, train_lat,
-                                 device, train_last_blocks=4, epochs=3, lr=1e-5,
-                                 holdout_frac=0.1, seed=42):
-    """Stage A0: unfreeze the last N MedSigLIP vision blocks and let them
-    actually learn from knee pixels, on the full weak+real pool (safe --
-    ~4,300+ studies, not the 58-study gold set, so overfitting risk here is
-    low). Run ONCE. After this, the checkpoint it saves makes MedSigLIP a
-    fixed function again (just a better-adapted one), so every stage after
-    this -- embedding, Stage A NN, Stage A XGBoost, Stage B, test inference
-    -- goes back to full cached speed automatically via load_medsiglip().
-
-    Single random holdout, not full 5-fold CV, and few epochs by default:
-    real backprop through a foundation model per study is far more
-    expensive per step than the cached-embedding path everything else in
-    this pipeline uses. This stage trades CV rigor for being affordable to
-    run at all; it is a warm-start improvement, not the scored model.
-    """
-    finetuned_path = MODEL_DIR / "medsiglip_finetuned_vision.pt"
-    if finetuned_path.exists():
-        print(f"  Found existing {finetuned_path} — skipping Stage A0 fine-tuning")
-        return finetuned_path
-
-    print(f"\n── STAGE A0: Fine-tune MedSigLIP (last {train_last_blocks} blocks) "
-          f"on {len(pretrain_ids)} studies ──")
-    processor, model, _ = load_medsiglip()  # stock weights -- no checkpoint exists yet
-    model = unfreeze_medsiglip_vision(model, train_last_blocks).train()
-
-    # GradScaler requires FP32 master weights for any parameter it updates --
-    # it can only unscale FP32 gradients ("Attempting to unscale FP16
-    # gradients" otherwise). load_medsiglip() loads the whole model in fp16
-    # for fast/cheap inference, which is fine for the frozen backbone, but
-    # the newly-unfrozen last N blocks (+ post_layernorm) are about to be
-    # optimized here, so upcast just those to fp32. Autocast still runs the
-    # forward pass in fp16/mixed precision for speed; only the trainable
-    # master weights need to be fp32.
-    for p in model.vision_model.parameters():
-        if p.requires_grad:
-            p.data = p.data.float()
-
-    rng = np.random.default_rng(seed)
-    shuffled = pretrain_ids.copy()
-    rng.shuffle(shuffled)
-    n_holdout = max(1, int(len(shuffled) * holdout_frac))
-    holdout_ids, train_ids = shuffled[:n_holdout], shuffled[n_holdout:]
-
-    lbl_idx = lbl.set_index("StudyInstanceUID")
-    is_real = lbl_idx["is_real_label"].to_numpy() if "is_real_label" in lbl_idx.columns \
-        else np.zeros(len(lbl_idx), dtype=bool)
-    is_real_map = dict(zip(lbl_idx.index, is_real))
-
-    head = nn.Linear(EMBED_DIM, len(TARGETS)).to(device)
-    trainable = [p for p in model.vision_model.parameters() if p.requires_grad] + list(head.parameters())
-    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
-    holdout_auc = float("nan")   # referenced after the loop; epochs=0 is legal
-
-    def _forward_study(study):
-        images = _study_images_for_finetune(study, train_slots, train_dcm, train_lat)
-        if not images:
-            return None
-        # A 3.5 GB MedSigLIP checkpoint plus gradients cannot safely process
-        # every slice of a study at once on a 6 GB RTX 3050. Select a
-        # deterministic, evenly-spaced subset; later epochs rotate the study
-        # order while preserving reproducibility. This limits activations,
-        # not the number of studies or supervision targets.
-        if len(images) > MEDSIGLIP_FINETUNE_MAX_IMAGES:
-            take = np.linspace(0, len(images) - 1, MEDSIGLIP_FINETUNE_MAX_IMAGES).round().astype(int)
-            images = [images[i] for i in take]
-        inputs = processor(images=images, return_tensors="pt")
-        pixels = inputs["pixel_values"].to(device)
-        if device == "cuda":
-            pixels = pixels.to(dtype=torch.float16)
-        feats = model.get_image_features(pixel_values=pixels)
-        if not torch.is_tensor(feats):
-            if hasattr(feats, "pooler_output"):
-                feats = feats.pooler_output
-            elif hasattr(feats, "image_embeds"):
-                feats = feats.image_embeds
-            elif hasattr(feats, "last_hidden_state"):
-                feats = feats.last_hidden_state.mean(1)
-            else:
-                raise ValueError(
-                    "get_image_features() returned an object with none of "
-                    "pooler_output / image_embeds / last_hidden_state -- "
-                    "cannot recover a feature tensor."
-                )
-        pooled = F.normalize(feats.float(), dim=-1).mean(dim=0, keepdim=True)  # [1, EMBED_DIM]
-        return head(pooled).squeeze(0)  # [N_TARGETS]
-
-    for epoch in range(epochs):
-        model.train()
-        losses = []
-        for study in rng.permutation(train_ids):
-            study = str(study)
-            if study not in lbl_idx.index:
-                continue
-            y = torch.tensor(lbl_idx.loc[study, TARGETS].astype(float).to_numpy(),
-                              dtype=torch.float32, device=device)
-            w_val = 3.0 if is_real_map.get(study, False) else \
-                float(np.clip(0.25 + 0.75 * (2.0 * np.abs(y.mean().item() - 0.5)), 0.25, 1.0))
-            opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=device == "cuda"):
-                logits = _forward_study(study)
-                if logits is None:
-                    continue
-                loss = F.binary_cross_entropy_with_logits(logits, y) * w_val
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-            scaler.step(opt)
-            scaler.update()
-            losses.append(float(loss.item()))
-
-        model.eval()
-        Y, P = [], []
-        with torch.no_grad():
-            for study in holdout_ids:
-                study = str(study)
-                if study not in lbl_idx.index:
-                    continue
-                with torch.amp.autocast("cuda", enabled=device == "cuda"):
-                    logits = _forward_study(study)
-                if logits is None:
-                    continue
-                P.append(torch.sigmoid(logits).cpu().numpy())
-                Y.append(lbl_idx.loc[study, TARGETS].astype(float).to_numpy())
-        holdout_auc = auc_mean(np.vstack(Y), np.vstack(P)) if Y else float("nan")
-        print(f"  [Stage A0] epoch {epoch+1}/{epochs}  loss={np.mean(losses):.5f}  "
-              f"holdout_auc={holdout_auc:.5f}")
-
-    torch.save({"vision_state_dict": model.vision_model.state_dict(),
-                "train_last_blocks": train_last_blocks,
-                "holdout_auc": holdout_auc}, finetuned_path)
-    print(f"  Saved fine-tuned MedSigLIP vision tower: {finetuned_path}")
-    del model, head
-    torch.cuda.empty_cache()
-    return finetuned_path
-
-
 class SlotAttentionModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1329,24 +941,6 @@ class SlotAttentionModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.15),
         )
-        # Optional sequence model over the slice dimension. Attention pooling
-        # alone is order-agnostic: it scores each slice independently, so it
-        # cannot express "these two ADJACENT slices both show it, so it's real"
-        # versus "one isolated slice, probably noise". A bi-GRU over the
-        # physically-ordered slices supplies that. Built only when enabled, so
-        # SEQ_MODEL="none" leaves the parameter set byte-identical to before.
-        self.seq_model = SEQ_MODEL
-        if SEQ_MODEL == "gru":
-            self.gru = nn.GRU(PROJ_DIM, SEQ_HIDDEN, num_layers=1,
-                              batch_first=True, bidirectional=True)
-            self.gru_out = nn.Linear(SEQ_HIDDEN * 2, PROJ_DIM)
-            self.gru_norm = nn.LayerNorm(PROJ_DIM)
-        # Learned slice-position embedding (see POS_EMB above). Small init
-        # (0.02) so an untrained embedding perturbs the projected features
-        # only slightly rather than swamping them.
-        self.use_pos_emb = POS_EMB
-        if POS_EMB:
-            self.pos_emb = nn.Parameter(torch.randn(POS_BINS, PROJ_DIM) * 0.02)
         self.att   = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(PROJ_DIM), nn.Linear(PROJ_DIM, 64),
@@ -1359,78 +953,8 @@ class SlotAttentionModel(nn.Module):
                 prior[t, s] = val * PRIOR_STRENGTH
         self.register_buffer("slot_prior", prior)
 
-    def _run_sequence(self, h, slot_indices):
-        """Run the GRU independently over each slot's contiguous slice run.
-
-        x (and therefore h) is the concatenation of every slot's slices --
-        e.g. 12 sagittal, then 12 coronal, then 12 axial. Running one GRU
-        across that whole sequence would model a "transition" from the last
-        sagittal slice to the first coronal slice, which is not a physical
-        neighbour relationship at all. Slice order WITHIN a slot is
-        meaningful (sort_slices guaranteed it); order ACROSS slots is not.
-
-        Residual (h + projected GRU output) so an unhelpful or untrained GRU
-        degrades toward the identity rather than destroying the projected
-        features -- enabling this can fail to help, but cannot catastrophically
-        break an otherwise working model.
-        """
-        out = h.clone()
-        # Contiguous runs of equal slot index. StudyDataset.get() builds
-        # slot_indices by extending per slot, so runs are already contiguous;
-        # this scan does not assume that, only that equal-and-adjacent
-        # indices belong together.
-        n = h.shape[0]
-        start = 0
-        for i in range(1, n + 1):
-            if i == n or slot_indices[i] != slot_indices[start]:
-                seg = h[start:i].unsqueeze(0)          # [1, seg_len, PROJ_DIM]
-                seg_out, _ = self.gru(seg)             # [1, seg_len, 2*SEQ_HIDDEN]
-                out[start:i] = h[start:i] + self.gru_norm(self.gru_out(seg_out.squeeze(0)))
-                start = i
-        return out
-
-    def _slice_positions(self, slot_indices):
-        """Normalized [0,1] position of each slice WITHIN ITS OWN slot run.
-
-        StudyDataset.get() concatenates slots in order, so slot_indices looks
-        like [0,0,0,0, 1,1,1, 2,2] -- contiguous runs. Position is derived
-        here rather than passed in, which keeps StudyDataset, forward()'s
-        signature, and every call site unchanged.
-
-        Per-slot, not global: position 0.5 must mean "middle of the sagittal
-        stack" and "middle of the coronal stack" alike. A global 0..1 across
-        the concatenated sequence would instead encode "which slot am I in",
-        which slot_prior already handles.
-
-        A single-slice run gets 0.5 (it IS the whole series, so mid-stack is
-        the honest description) rather than 0.0, which would falsely mark it
-        as the top edge.
-        """
-        n = slot_indices.shape[0]
-        pos = torch.zeros(n, device=slot_indices.device, dtype=torch.float32)
-        start = 0
-        for i in range(1, n + 1):
-            if i == n or slot_indices[i] != slot_indices[start]:
-                seg_len = i - start
-                if seg_len == 1:
-                    pos[start:i] = 0.5
-                else:
-                    pos[start:i] = torch.linspace(0.0, 1.0, seg_len,
-                                                  device=slot_indices.device)
-                start = i
-        return pos
-
     def forward(self, x, mask, slot_indices):
         h       = self.proj(x)
-        if self.use_pos_emb:
-            # Applied BEFORE the GRU so the sequence model sees position too,
-            # and before attention scoring so scores can depend on where a
-            # slice sits in the stack.
-            p    = self._slice_positions(slot_indices)
-            bins = (p * (POS_BINS - 1)).round().long().clamp(0, POS_BINS - 1)
-            h    = h + self.pos_emb[bins]
-        if self.seq_model == "gru":
-            h   = self._run_sequence(h, slot_indices)
         scores  = self.att(h).T
         scores  = scores + self.slot_prior[:, slot_indices]
         absent  = (mask[slot_indices] < 0.5)
@@ -1452,15 +976,6 @@ def load_embedding(path):
                  if torch.is_tensor(v)]
         if not cands: raise ValueError(f"No tensor in {path}")
         x = cands[0]
-    # torch.load() normally strips requires_grad, but not guaranteed for every
-    # object that could have been saved here -- a tensor saved mid-autograd-
-    # graph keeps requires_grad=True on reload. Every downstream consumer of
-    # this function eventually calls .numpy(), which crashes on such a tensor
-    # with "Can't call numpy() on Tensor that requires grad." Detaching here,
-    # once, at the single source every embedding load goes through, is more
-    # reliable than trying to remember .detach() at every call site downstream.
-    if x.requires_grad:
-        x = x.detach()
     x = x.float()
     if x.ndim == 1: x = x.unsqueeze(0)
     if x.ndim != 2 or x.shape[1] != EMBED_DIM:
@@ -1468,41 +983,19 @@ def load_embedding(path):
     return x
 
 
-def build_slot_file_map(emb_df):
-    """{StudyInstanceUID: {slot_name: embedding_file}} for present slots only.
-
-    Built once per dataset instead of re-filtering the whole embedding index on
-    every __getitem__. The old `emb_df[emb_df["StudyInstanceUID"] == study]`
-    inside get() is a full linear scan of a 4,349-study x 6-slot frame, executed
-    once per study per epoch per fold -- i.e. quadratic in the pool size, and by
-    far the largest fixed cost in Stage A. Same values, one pass.
-    """
-    m = {}
-    cols = emb_df[["StudyInstanceUID", "slot_name", "embedding_file", "presence_mask"]]
-    for study, slot, path, present in cols.itertuples(index=False, name=None):
-        # presence_mask can arrive as int, float or numpy scalar depending on
-        # whether the index was just built or reloaded from CSV.
-        if int(present) == 1:
-            m.setdefault(str(study), {})[slot] = path
-    return m
-
-
 class StudyDataset:
     def __init__(self, emb_df, labels_df):
         self.emb_df = emb_df
         self.labels = labels_df.set_index("StudyInstanceUID")
         self.ids    = sorted(emb_df["StudyInstanceUID"].unique())
-        self._slot_map = build_slot_file_map(emb_df)
-        # Label lookup as plain numpy, so the per-study .loc[study, TARGETS]
-        # (which re-does a pandas indexing + astype on every access) happens once.
-        self._y = {str(s): self.labels.loc[s, TARGETS].astype(float).to_numpy(dtype=np.float32)
-                   for s in self.ids}
 
     def __len__(self): return len(self.ids)
 
     def get(self, i):
         study = self.ids[i]
-        slot_to_file = self._slot_map.get(str(study), {})
+        rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
+        slot_to_file = {r["slot_name"]: r["embedding_file"]
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1518,7 +1011,8 @@ class StudyDataset:
             slot_indices = [0]
         x   = torch.cat(tensors, dim=0)
         idx = torch.tensor(slot_indices, dtype=torch.long)
-        y   = torch.from_numpy(self._y[str(study)]).clone()
+        y   = torch.tensor(self.labels.loc[study, TARGETS].astype(float).values,
+                           dtype=torch.float32)
         return study, x, mask, idx, y
 
 
@@ -1562,433 +1056,13 @@ def auc_mean(y_true, y_pred):
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def bootstrap_auc_ci(y_true, y_pred, n_boot=1000, ci=0.90, seed=42):
-    """
-    Bootstrap confidence interval for auc_mean(y_true, y_pred), resampling
-    STUDIES (rows) with replacement. With only 58 real-labeled studies to
-    validate against, a single point-estimate AUC can look like real
-    improvement (or real regression) when it's actually noise from which
-    58 studies happened to be in this dataset -- this reports how wide
-    that uncertainty band actually is, per the same logic RSNA aneurysm
-    winners used (bootstrap intervals over n=58-scale gold sets).
-
-    Returns (point_estimate, lo, hi) for the given ci (default 90%, i.e.
-    5th/95th percentile of the bootstrap distribution). Targets with no
-    positive/negative variation in a given resample are skipped for that
-    resample (same convention as auc_mean).
-    """
-    rng = np.random.RandomState(seed)
-    n = y_true.shape[0]
-    point = auc_mean(y_true, y_pred)
-    boot_vals = []
-    for _ in range(n_boot):
-        sample_idx = rng.randint(0, n, size=n)
-        v = auc_mean(y_true[sample_idx], y_pred[sample_idx])
-        if not np.isnan(v):
-            boot_vals.append(v)
-    if not boot_vals:
-        return point, float("nan"), float("nan")
-    lo_pct = (1.0 - ci) / 2.0 * 100
-    hi_pct = (1.0 - (1.0 - ci) / 2.0) * 100
-    lo = float(np.percentile(boot_vals, lo_pct))
-    hi = float(np.percentile(boot_vals, hi_pct))
-    return point, lo, hi
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STAGE 0 — MRNet auxiliary pretraining (ACL only)
-#
-# MRNet (Stanford, https://stanfordmlgroup.github.io/competitions/mrnet/) is
-# a public knee-MRI dataset with ACL tear labels on ~1,370 exams -- far more
-# than our own 58 real-labeled studies. Used ONLY for the ACL head: MRNet's
-# meniscus label doesn't distinguish medial/lateral the way our targets do,
-# so it is skipped entirely rather than injected as an ambiguous signal.
-# Entirely optional -- if MRNET_ROOT doesn't exist, Stage 0 is skipped
-# automatically (RUN_MRNET_PRETRAIN=False) and training proceeds exactly
-# as before this was added.
-# ══════════════════════════════════════════════════════════════════════════════
-def load_mrnet_labels(mrnet_root: Path):
-    """
-    Reads MRNet's train-acl.csv / valid-acl.csv (columns: id, label -- no
-    header). Returns a DataFrame with columns [split, id, label], id
-    zero-padded to 4 digits to match MRNet's .npy filenames (e.g. '0000').
-    """
-    rows = []
-    for split in ("train", "valid"):
-        csv_path = mrnet_root / f"{split}-acl.csv"
-        if not csv_path.exists():
-            continue
-        df = pd.read_csv(csv_path, header=None, names=["id", "label"])
-        df["id"] = df["id"].map(lambda i: str(i).zfill(4))
-        df["split"] = split
-        rows.append(df)
-    if not rows:
-        raise FileNotFoundError(f"No train-acl.csv/valid-acl.csv found under {mrnet_root}")
-    return pd.concat(rows, ignore_index=True)
-
-
-def mrnet_npy_to_pil_list(npy_path: Path):
-    """MRNet stores a whole series as one stacked .npy array [n_slices, H, W]."""
-    arr = np.load(npy_path)
-    images = []
-    for sl in arr:
-        sl = sl.astype(np.float32)
-        lo, hi = np.percentile(sl, [1, 99])
-        if hi <= lo:
-            lo, hi = float(sl.min()), float(sl.max())
-        if hi <= lo:
-            sl8 = np.zeros_like(sl, dtype=np.uint8)
-        else:
-            sl8 = (np.clip((sl - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-        images.append(Image.fromarray(sl8).convert("RGB"))
-    return images
-
-
-def embed_mrnet(mrnet_root: Path, labels_df: pd.DataFrame, processor, model, device, out_dir: Path):
-    """
-    Embeds every MRNet exam's 3 planes through MedSigLIP, same encode_images()
-    path used for our own DICOM data, so the resulting embeddings are
-    directly compatible with SlotAttentionModel. One .pt file per
-    exam/plane, mirroring the {study}/{series}__{slot}.pt layout embed_slots()
-    already uses, so StudyDataset can load them unmodified. Single-pass
-    (no TTA) -- this is pretraining data, same convention as our own
-    train embeddings.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index_rows = []
-    for row in tqdm(labels_df.itertuples(index=False), total=len(labels_df), desc="  Embedding MRNet"):
-        study_id = f"mrnet_{row.split}_{row.id}"
-        for plane, slot in MRNET_PLANE_TO_SLOT.items():
-            npy_path = mrnet_root / row.split / plane / f"{row.id}.npy"
-            if not npy_path.exists():
-                continue
-            out_path = out_dir / study_id / f"{plane}__{slot}.pt"
-            if out_path.exists():
-                index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": plane,
-                                   "slot_name": slot, "embedding_file": str(out_path),
-                                   "presence_mask": 1})
-                continue
-            try:
-                images = mrnet_npy_to_pil_list(npy_path)
-                if not images:
-                    continue
-                feats = encode_images(images, processor, model, device)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({"embeddings": feats, "slot_name": slot, "study_uid": study_id,
-                           "series_uid": plane, "laterality": None, "plane": plane,
-                           "n_slices": len(images)}, out_path)
-                index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": plane,
-                                   "slot_name": slot, "embedding_file": str(out_path),
-                                   "presence_mask": 1})
-            except Exception as e:
-                print(f"\n  [WARN] MRNet {study_id}/{plane}: {e}")
-    return pd.DataFrame(index_rows)
-
-
-def load_kneemri_labels(root: Path):
-    """Read KneeMRI metadata.csv and locate each volume file on disk.
-
-    Volumes are split across vol01..vol08 subfolders with no column recording
-    which, so this indexes the folders once and joins by filename.
-
-    Returns a DataFrame with:
-      study_id  -- "kneemri_{examId}_{seriesNo}", unique per row
-      label     -- binary ACL target per KNEEMRI_POSITIVE_FROM
-      is_right  -- bool, per KNEEMRI_RIGHT_VALUE
-      path      -- resolved absolute path to the .pck
-      roi*      -- passthrough of the six ROI columns
-    """
-    meta_path = root / "metadata.csv"
-    if not meta_path.is_file():
-        raise FileNotFoundError(f"KneeMRI metadata.csv not found at {meta_path}")
-    df = pd.read_csv(meta_path)
-
-    required = ["examId", "seriesNo", "aclDiagnosis", "kneeLR", "volumeFilename",
-                "roiX", "roiY", "roiZ", "roiHeight", "roiWidth", "roiDepth"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"KneeMRI metadata.csv missing columns: {missing}")
-
-    # index every .pck across vol* folders (and the root, just in case)
-    file_index = {}
-    for sub in sorted(root.glob("vol*")) + [root]:
-        if sub.is_dir():
-            for p in sub.glob("*.pck"):
-                file_index.setdefault(p.name, p)
-    df["path"] = df["volumeFilename"].map(lambda n: file_index.get(str(n)))
-    n_missing = int(df["path"].isna().sum())
-    if n_missing:
-        print(f"  [WARN] {n_missing}/{len(df)} KneeMRI volumes listed in metadata.csv "
-              f"were not found on disk — those rows are dropped")
-        df = df[df["path"].notna()].copy()
-
-    if KNEEMRI_POSITIVE_FROM == "full":
-        df["label"] = (df["aclDiagnosis"] == 2).astype(float)
-    else:
-        df["label"] = (df["aclDiagnosis"] > 0).astype(float)
-
-    df["is_right"] = (df["kneeLR"] == KNEEMRI_RIGHT_VALUE)
-    df["study_id"] = ("kneemri_" + df["examId"].astype(str) + "_"
-                      + df["seriesNo"].astype(str))
-    if df["study_id"].duplicated().any():
-        raise ValueError("KneeMRI examId+seriesNo is not unique — cannot build study ids")
-
-    n_pos = int(df["label"].sum())
-    print(f"  KneeMRI: {len(df)} exams  |  positives={n_pos} ({n_pos/max(len(df),1):.1%}) "
-          f"under KNEEMRI_POSITIVE='{KNEEMRI_POSITIVE_FROM}'")
-    print(f"  KneeMRI: treating kneeLR=={KNEEMRI_RIGHT_VALUE} as RIGHT "
-          f"({int(df['is_right'].sum())} of {len(df)}). metadata.csv does not "
-          f"document this — if laterality QA looks wrong, set RSNA_KNEEMRI_RIGHT "
-          f"to the other value.")
-    return df
-
-
-def kneemri_pck_to_pil_list(path, roi=None, is_right=False):
-    """Load one pickled KneeMRI volume ([Z,H,W] uint16) into a list of PIL images.
-
-    Applies the same 1-99 percentile windowing dicom_to_pil() uses, so these
-    images land in a comparable intensity distribution to our own data rather
-    than a differently-scaled one the encoder would treat as a separate domain.
-
-    roi: dict with x/y/z/height/width/depth, honored per KNEEMRI_ROI_MODE.
-    is_right: right knees get their sagittal slice order reversed, matching
-              normalise_laterality()'s sagittal branch, so left and right
-              exams present anatomy in a consistent through-plane direction.
-    """
-    with open(path, "rb") as f:
-        vol = pickle.load(f)
-    vol = np.asarray(vol)
-    if vol.ndim != 3:
-        raise ValueError(f"{path}: expected a 3D volume, got shape {vol.shape}")
-
-    if roi is not None and KNEEMRI_ROI_MODE != "none":
-        z, h, w = vol.shape
-        # ROI x/width index the horizontal axis, y/height the vertical.
-        cx, cy = float(roi["x"]), float(roi["y"])
-        rw, rh = float(roi["width"]), float(roi["height"])
-        mx, my = rw * KNEEMRI_ROI_MARGIN, rh * KNEEMRI_ROI_MARGIN
-        x0 = int(max(0, np.floor(cx - mx)));        x1 = int(min(w, np.ceil(cx + rw + mx)))
-        y0 = int(max(0, np.floor(cy - my)));        y1 = int(min(h, np.ceil(cy + rh + my)))
-        # Guard against a degenerate crop (bad ROI row) collapsing the image.
-        if x1 - x0 >= 16 and y1 - y0 >= 16:
-            vol = vol[:, y0:y1, x0:x1]
-        if KNEEMRI_ROI_MODE == "xyz":
-            cz, rd = float(roi["z"]), float(roi["depth"])
-            mz = max(2.0, rd * KNEEMRI_ROI_MARGIN)
-            z0 = int(max(0, np.floor(cz - mz)))
-            z1 = int(min(z, np.ceil(cz + rd + mz)))
-            if z1 - z0 >= 3:
-                vol = vol[z0:z1]
-
-    images = []
-    for sl in vol:
-        arr = sl.astype(np.float32)
-        lo, hi = np.percentile(arr, [1, 99])
-        if hi <= lo:
-            lo, hi = float(arr.min()), float(arr.max())
-        if hi <= lo:
-            arr8 = np.zeros_like(arr, dtype=np.uint8)
-        else:
-            arr8 = (np.clip((arr - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-        images.append(Image.fromarray(arr8))
-
-    if is_right:
-        images = images[::-1]
-
-    if SLICE_MODE == "2.5d" and len(images) > 1:
-        ref = images[len(images) // 2].size
-        images = [g if g.size == ref else g.resize(ref, Image.BILINEAR) for g in images]
-        n = len(images)
-        return [Image.merge("RGB", (images[i-1] if i > 0 else images[i],
-                                     images[i],
-                                     images[i+1] if i < n-1 else images[i]))
-                for i in range(n)]
-    return [g.convert("RGB") for g in images]
-
-
-def embed_kneemri(labels_df: pd.DataFrame, processor, model, device, out_dir: Path):
-    """Embed every KneeMRI volume through MedSigLIP via the same encode_images()
-    path used for our own DICOM data, so the cached tensors are directly
-    loadable by StudyDataset with no special-casing.
-
-    One .pt per exam, under the single slot KNEEMRI_SLOT (these are sagittal
-    single-series exams -- there is no multi-slot structure to preserve).
-    Single-pass, no TTA, matching the train-embedding convention.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index_rows, failed = [], 0
-    for row in tqdm(labels_df.itertuples(index=False), total=len(labels_df),
-                     desc="  Embedding KneeMRI"):
-        study_id = row.study_id
-        out_path = out_dir / study_id / f"{study_id}__{KNEEMRI_SLOT}.pt"
-        if out_path.exists():
-            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": study_id,
-                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
-                               "presence_mask": 1})
-            continue
-        try:
-            roi = {"x": row.roiX, "y": row.roiY, "z": row.roiZ,
-                   "height": row.roiHeight, "width": row.roiWidth, "depth": row.roiDepth}
-            images = kneemri_pck_to_pil_list(row.path, roi=roi, is_right=bool(row.is_right))
-            if not images:
-                failed += 1
-                continue
-            feats = encode_images(images, processor, model, device)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"embeddings": feats, "slot_name": KNEEMRI_SLOT,
-                        "study_uid": study_id, "series_uid": study_id,
-                        "laterality": "R" if row.is_right else "L",
-                        "plane": "Sagittal", "n_slices": len(images)}, out_path)
-            index_rows.append({"StudyInstanceUID": study_id, "SeriesInstanceUID": study_id,
-                               "slot_name": KNEEMRI_SLOT, "embedding_file": str(out_path),
-                               "presence_mask": 1})
-        except Exception as e:
-            print(f"\n  [WARN] KneeMRI {study_id}: {e}")
-            failed += 1
-    if failed:
-        print(f"  KneeMRI: {failed} exam(s) failed to embed")
-    return pd.DataFrame(index_rows)
-
-
-def train_stage0_mrnet(mrnet_emb_idx: pd.DataFrame, mrnet_labels: pd.DataFrame,
-                       device, epochs=15, lr=1e-4, weight_decay=1e-4):
-    """
-    Pretrains SlotAttentionModel on MRNet's ACL labels only. The other 11
-    output heads receive zero gradient (loss is masked to the ACL column
-    only) so they stay at their random initialization, exactly as if Stage
-    0 had never run for them -- only the ACL head and the shared backbone
-    (proj/attention layers) actually learn anything here. Stage A then
-    continues training ALL heads (including ACL) from these weights, via
-    train_fold's init_state_dict parameter.
-
-    Returns the trained model (best-val-AUC state loaded), or None if
-    there wasn't enough MRNet data to train on.
-    """
-    acl_idx = TARGETS.index("ACL")
-    study_ids = sorted(mrnet_emb_idx["StudyInstanceUID"].unique())
-    # Two accepted label-frame shapes, so one trainer serves both external
-    # sources without duplicating the training loop:
-    #   MRNet   -- columns [split, id, label]; study id is built here.
-    #   KneeMRI -- already carries a "study_id" column built by
-    #              load_kneemri_labels(), so it is used directly.
-    if "study_id" in mrnet_labels.columns:
-        label_lookup = mrnet_labels.set_index("study_id")["label"]
-    else:
-        label_lookup = mrnet_labels.set_index(
-            mrnet_labels.apply(lambda r: f"mrnet_{r['split']}_{r['id']}", axis=1))["label"]
-
-    # build a labels_df shaped like the rest of the pipeline expects
-    # (StudyInstanceUID + TARGETS columns), with all non-ACL targets set to
-    # 0.0 -- never read for loss (masked out below), kept only so
-    # StudyDataset's .loc[study, TARGETS] lookup doesn't break
-    rows = []
-    for sid in study_ids:
-        if sid not in label_lookup.index:
-            continue
-        rec = {"StudyInstanceUID": sid}
-        for t in TARGETS:
-            rec[t] = float(label_lookup[sid]) if t == "ACL" else 0.0
-        rows.append(rec)
-    mrnet_lbl_df = pd.DataFrame(rows)
-    if len(mrnet_lbl_df) < 10:
-        print(f"  [WARN] Only {len(mrnet_lbl_df)} external studies have embeddings -- skipping Stage 0")
-        return None
-
-    rng = np.random.RandomState(SAMPLE_SEED)
-    ids_arr = mrnet_lbl_df["StudyInstanceUID"].values
-    perm = rng.permutation(len(ids_arr))
-    n_val = max(1, int(0.15 * len(ids_arr)))
-    val_ids = set(ids_arr[perm[:n_val]])
-    tr_ids  = set(ids_arr[perm[n_val:]])
-
-    tr_ds = StudyDataset(mrnet_emb_idx[mrnet_emb_idx["StudyInstanceUID"].isin(tr_ids)],
-                         mrnet_lbl_df[mrnet_lbl_df["StudyInstanceUID"].isin(tr_ids)])
-    va_ds = StudyDataset(mrnet_emb_idx[mrnet_emb_idx["StudyInstanceUID"].isin(val_ids)],
-                         mrnet_lbl_df[mrnet_lbl_df["StudyInstanceUID"].isin(val_ids)])
-    print(f"  Stage 0 (external ACL): train={len(tr_ds)}  val={len(va_ds)}")
-
-    model = SlotAttentionModel().to(device)
-    if USE_COMPILE:
-        try:
-            model = torch.compile(model)
-        except Exception:
-            pass
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    y_all = np.array([float(label_lookup[s]) for s in tr_ids if s in label_lookup.index])
-    pos = y_all.sum()
-    pw = max((len(y_all) - pos) / max(pos, 1), 1.0)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
-    best_state, best_auc = None, -np.inf
-
-    for epoch in range(epochs):
-        model.train()
-        losses = []
-        for i in np.random.permutation(len(tr_ds)):
-            _, x, mask, idx, y = tr_ds.get(i)
-            x, mask, idx = x.to(device), mask.to(device), idx.to(device)
-            y_acl = y[acl_idx:acl_idx + 1].to(device)
-            opt.zero_grad()
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(x, mask, idx)
-                # only the ACL head contributes to the loss -- everything
-                # else stays untouched at random initialization
-                loss = loss_fn(out[acl_idx:acl_idx + 1], y_acl)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            scaler.step(opt)
-            scaler.update()
-            losses.append(float(loss.item()))
-
-        model.eval()
-        Y, P = [], []
-        with torch.no_grad():
-            for i in range(len(va_ds)):
-                _, x, mask, idx, y = va_ds.get(i)
-                out = torch.sigmoid(model(x.to(device), mask.to(device), idx.to(device)))
-                P.append(float(out[acl_idx].cpu()))
-                Y.append(float(y[acl_idx]))
-        auc = roc_auc_score(Y, P) if len(np.unique(Y)) > 1 else float("nan")
-        print(f"  [Stage 0] epoch {epoch+1:02d}  loss={np.mean(losses):.5f}  "
-              f"val_acl_auc={auc if auc == auc else float('nan'):.5f}")
-        if not np.isnan(auc) and auc > best_auc:
-            best_auc = auc
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    if best_state:
-        model.load_state_dict(best_state)
-    print(f"  Stage 0 best ACL val AUC: {best_auc:.5f}")
-    return model
-
-
-def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None,
-               weight_map=None):
-    """weight_map: optional {StudyInstanceUID: float32[len(TARGETS)]} of
-    per-target confidence weights (see soft_label_weight).
-
-    The XGBoost branch already weighted weak labels by the parser's own __conf
-    score, but the neural branch trained every weak label at equal weight -- so
-    a target the parser was 0.3 confident about pushed the attention model
-    exactly as hard as a gold 0/1. Passing the same weights the trees use makes
-    the two branches consistent and stops low-evidence parser guesses from
-    dominating a 4,000-study pool.
-    """
+def train_fold(train_ds, val_ds, device, epochs):
     model   = SlotAttentionModel().to(device)
-    if init_state_dict is not None:
-        # Seed from Stage 0 (MRNet ACL auxiliary pretraining) weights when
-        # given, instead of the model's random initialization. Safe no-op
-        # when init_state_dict is None (all existing call sites unaffected).
-        model = load_state_dict_safe(model, init_state_dict)
-    # torch.compile is OFF by default here (RSNA_COMPILE=1 to enable). Every
-    # study has a different slice count, and forward() contains data-dependent
-    # Python loops (_run_sequence, _slice_positions, the 12-head loop), so Dynamo
-    # re-traces on nearly every step instead of amortizing a compile.
-    if USE_COMPILE:
-        try:
-            model = torch.compile(model)
-        except Exception:
-            pass  # older PyTorch — skip compile
+    # torch.compile gives ~15% speedup on PyTorch 2.0+ (safe, no result change)
+    try:
+        model = torch.compile(model)
+    except Exception:
+        pass  # older PyTorch — skip compile
     opt     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
@@ -1996,40 +1070,23 @@ def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None,
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
-    # Unreduced twin, used only when per-study/per-target weights are supplied.
-    loss_fn_w = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
-                                     reduction="none")
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
         model.train()
         losses = []
-        # Studies have different slice counts so they cannot be stacked into a
-        # real batch, which meant every optimizer step was taken on a SINGLE
-        # study -- maximally noisy gradients, and 15 of those steps per epoch on
-        # a 12-study fold. Accumulate ACCUM_STEPS studies per step instead: same
-        # memory, same number of forward passes, far steadier updates.
-        opt.zero_grad(set_to_none=True)
-        _n = len(train_ds)
-        for _k, i in enumerate(np.random.permutation(_n), 1):
-            _sid, x, mask, idx, y = train_ds.get(i)
+        for i in np.random.permutation(len(train_ds)):
+            _, x, mask, idx, y = train_ds.get(i)
             x, mask, idx, y = x.to(device, non_blocking=True), mask.to(device, non_blocking=True), idx.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            _w = None if weight_map is None else weight_map.get(str(_sid))
+            opt.zero_grad()
             with torch.amp.autocast("cuda", enabled=device.type=="cuda"):
-                _logits = model(x, mask, idx)
-                if _w is None:
-                    loss = loss_fn(_logits, y) / ACCUM_STEPS
-                else:
-                    _wt = torch.as_tensor(_w, dtype=torch.float32, device=device)
-                    loss = (loss_fn_w(_logits, y) * _wt).mean() / ACCUM_STEPS
+                loss = loss_fn(model(x, mask, idx), y)
             scaler.scale(loss).backward()
-            losses.append(float(loss.item()) * ACCUM_STEPS)
-            if _k % ACCUM_STEPS == 0 or _k == _n:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            scaler.step(opt)
+            scaler.update()
+            losses.append(float(loss.item()))
 
         model.eval()
         Y, P = [], []
@@ -2049,19 +1106,11 @@ def train_fold(train_ds, val_ds, device, epochs, init_state_dict=None,
     return model
 
 
-def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5,
-                  select_on_val=True, weight_map=None):
+def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
     """
     Same loop as train_fold, but takes an already-initialized model (e.g.
     Stage A weak-label weights) and fine-tunes it with a smaller LR instead
     of training from scratch. Used for Stage B (58 real labels).
-
-    select_on_val=False returns the FINAL-epoch weights instead of the
-    best-scoring ones. Callers that will later report val_ds as out-of-fold
-    must pass False (or pass an inner selection split as val_ds), because
-    keeping the epoch that happened to score highest on a 12-study fold is
-    model selection on the evaluation set -- worth several AUC points of
-    pure optimism at this sample size.
     """
     opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
@@ -2070,40 +1119,23 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5,
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
-    # Unreduced twin, used only when per-study/per-target weights are supplied.
-    loss_fn_w = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
-                                     reduction="none")
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
         model.train()
         losses = []
-        # Studies have different slice counts so they cannot be stacked into a
-        # real batch, which meant every optimizer step was taken on a SINGLE
-        # study -- maximally noisy gradients, and 15 of those steps per epoch on
-        # a 12-study fold. Accumulate ACCUM_STEPS studies per step instead: same
-        # memory, same number of forward passes, far steadier updates.
-        opt.zero_grad(set_to_none=True)
-        _n = len(train_ds)
-        for _k, i in enumerate(np.random.permutation(_n), 1):
-            _sid, x, mask, idx, y = train_ds.get(i)
+        for i in np.random.permutation(len(train_ds)):
+            _, x, mask, idx, y = train_ds.get(i)
             x, mask, idx, y = x.to(device, non_blocking=True), mask.to(device, non_blocking=True), idx.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            _w = None if weight_map is None else weight_map.get(str(_sid))
+            opt.zero_grad()
             with torch.amp.autocast("cuda", enabled=device.type=="cuda"):
-                _logits = model(x, mask, idx)
-                if _w is None:
-                    loss = loss_fn(_logits, y) / ACCUM_STEPS
-                else:
-                    _wt = torch.as_tensor(_w, dtype=torch.float32, device=device)
-                    loss = (loss_fn_w(_logits, y) * _wt).mean() / ACCUM_STEPS
+                loss = loss_fn(model(x, mask, idx), y)
             scaler.scale(loss).backward()
-            losses.append(float(loss.item()) * ACCUM_STEPS)
-            if _k % ACCUM_STEPS == 0 or _k == _n:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            scaler.step(opt)
+            scaler.update()
+            losses.append(float(loss.item()))
 
         model.eval()
         Y, P = [], []
@@ -2115,12 +1147,11 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5,
                 Y.append(y.numpy())
         auc = auc_mean(np.vstack(Y), np.vstack(P))
         print(f"  [finetune] epoch {epoch+1:02d}  loss={np.mean(losses):.5f}  val_auc={auc:.5f}")
-        if select_on_val and not np.isnan(auc) and auc > best_auc:
+        if not np.isnan(auc) and auc > best_auc:
             best_auc   = auc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    if select_on_val and best_state:
-        model.load_state_dict(best_state)
+    if best_state: model.load_state_dict(best_state)
     return model
 
 
@@ -2131,13 +1162,14 @@ class InferDataset:
     def __init__(self, emb_df):
         self.emb_df = emb_df
         self.ids    = sorted(emb_df["StudyInstanceUID"].unique())
-        self._slot_map = build_slot_file_map(emb_df)
 
     def __len__(self): return len(self.ids)
 
     def get(self, i):
         study = self.ids[i]
-        slot_to_file = self._slot_map.get(str(study), {})
+        rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
+        slot_to_file = {r["slot_name"]: r["embedding_file"]
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -2161,9 +1193,7 @@ def run_inference(emb_df, model_paths, device):
     for mp in model_paths:
         model = SlotAttentionModel().to(device)
         ckpt  = torch.load(mp, map_location=device, weights_only=False)
-        # load_state_dict_safe, not raw load_state_dict: fold checkpoints saved
-        # from a torch.compile'd model carry an "_orig_mod." prefix on every key.
-        model = load_state_dict_safe(model, ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
         preds = np.zeros((len(ds), len(TARGETS)), dtype=np.float32)
         with torch.no_grad():
@@ -2176,105 +1206,6 @@ def run_inference(emb_df, model_paths, device):
 
     study_ids = ds.ids
     return study_ids, all_preds
-
-
-# Guarded pseudo-labeling: after Stage B (fine-tuned on the 58 real
-# studies) exists, use it to re-score the WEAK-labeled studies only --
-# the 58 real studies are never touched, never re-scored, never
-# overwritten. A weak label is only replaced where the image model is
-# extremely confident (>= PSEUDO_LABEL_HIGH or <= PSEUDO_LABEL_LOW) AND
-# that confident image-based call does not contradict a confident
-# existing text-based signal (checked via the parser's own __conf column
-# for that target). This is deliberately conservative: with only 58 real
-# studies to validate the image model against, a wrong confident call
-# from the image model has no cheap way to be caught later, so both
-# gates (image confidence AND non-contradiction with confident text
-# evidence) must pass before a label is touched.
-PSEUDO_LABEL_HIGH = 0.95
-PSEUDO_LABEL_LOW  = 0.05
-# Text evidence counts as "confident" (and therefore not to be overridden
-# by a contradicting image call) at this __conf threshold or above.
-PSEUDO_LABEL_TEXT_CONF_GATE = 0.60
-
-
-def apply_guarded_pseudo_labels(weak_df, weak_emb_idx, model_paths, device,
-                                 targets=TARGETS):
-    """
-    weak_df       : rows for weak-labeled studies only (is_real_label=False),
-                     must contain StudyInstanceUID, each f"{t}" soft label,
-                     and each f"{t}__conf" text-confidence column.
-    weak_emb_idx  : embedding index (StudyInstanceUID/SeriesInstanceUID/
-                     slot_name/embedding_file/presence_mask) for those same
-                     studies -- reuse the already-cached train_emb_idx,
-                     filtered to weak study IDs; no re-embedding needed.
-    model_paths   : Stage B fold_*.pt paths (fine-tuned on the 58 real
-                     studies) -- the SAME model_paths used for test
-                     inference, reused here rather than retrained.
-
-    Returns (updated_df, report_df). updated_df is weak_df with any
-    replaced label values written in place (only f"{t}" columns change;
-    __conf columns are left as-is -- a replaced label keeps its original
-    text-confidence value, since that value describes the parser's
-    evidence, not the image model's). report_df has one row per target
-    with counts of studies replaced toward 1 and toward 0, for full
-    transparency before this is trusted.
-    """
-    study_ids_present = set(weak_emb_idx["StudyInstanceUID"].astype(str))
-    scoreable = weak_df[weak_df["StudyInstanceUID"].astype(str).isin(study_ids_present)].copy()
-    if scoreable.empty:
-        print("  [WARN] No weak studies have cached embeddings -- skipping pseudo-labeling")
-        return weak_df, pd.DataFrame(columns=["target", "n_set_to_1", "n_set_to_0", "n_blocked_by_text"])
-
-    print(f"  Scoring {len(scoreable)} weak-labeled studies with Stage B model "
-          f"({len(model_paths)} fold(s))...")
-    img_study_ids, img_preds = run_inference(weak_emb_idx, model_paths, device)
-    img_pred_by_study = {sid: img_preds[i] for i, sid in enumerate(img_study_ids)}
-
-    updated_df = weak_df.copy()
-    # .at[sid, col] below requires a unique index; a duplicated StudyInstanceUID
-    # (easy to introduce when label CSVs are concatenated) makes it return a
-    # Series and raise, aborting the whole pseudo-labeling pass.
-    n_dupes = int(updated_df["StudyInstanceUID"].duplicated().sum())
-    if n_dupes:
-        print(f"  [WARN] {n_dupes} duplicate StudyInstanceUID rows in the weak label "
-              f"set — keeping the first of each")
-        updated_df = updated_df.drop_duplicates(subset="StudyInstanceUID", keep="first")
-    updated_df = updated_df.set_index("StudyInstanceUID", drop=False)
-    report_rows = []
-
-    for t_idx, t in enumerate(targets):
-        conf_col = f"{t}__conf"
-        has_conf = conf_col in updated_df.columns
-        n_hi = n_lo = n_blocked = 0
-
-        for sid in scoreable["StudyInstanceUID"].astype(str):
-            if sid not in img_pred_by_study:
-                continue
-            img_score = float(img_pred_by_study[sid][t_idx])
-            if img_score < PSEUDO_LABEL_HIGH and img_score > PSEUDO_LABEL_LOW:
-                continue  # image model not confident enough either way
-
-            image_says_present = img_score >= PSEUDO_LABEL_HIGH
-            text_conf   = float(updated_df.at[sid, conf_col]) if has_conf else 0.0
-            text_score  = float(updated_df.at[sid, t])
-            text_says_present  = text_score >= 0.5
-            text_is_confident  = text_conf >= PSEUDO_LABEL_TEXT_CONF_GATE
-
-            if text_is_confident and (text_says_present != image_says_present):
-                n_blocked += 1
-                continue  # confident text signal disagrees -- do not override
-
-            new_val = 1.0 if image_says_present else 0.0
-            updated_df.at[sid, t] = new_val
-            if image_says_present: n_hi += 1
-            else:                  n_lo += 1
-
-        report_rows.append({"target": t, "n_set_to_1": n_hi, "n_set_to_0": n_lo,
-                             "n_blocked_by_text": n_blocked})
-
-    updated_df = updated_df.reset_index(drop=True)
-    report_df = pd.DataFrame(report_rows)
-    return updated_df, report_df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2323,108 +1254,38 @@ XGB_PARAMS = dict(
     tree_method="hist", verbosity=0,
 )
 XGB_N_ESTIMATORS = 300
-# Blend search grid: alpha = NN weight, 1-alpha = XGBoost weight.
-# 1.0 (NN-only) is always included and is the fallback-safe default if
-# blending never helps. Finer step (0.05) and extended range (down to 0.0,
-# i.e. XGBoost-only) versus the original 5-point 0.15-step grid -- this
-# reuses the SAME already-computed OOF predictions, so the extra search
-# cost is negligible (no retraining, just more arithmetic on arrays
-# already in memory).
-ALPHA_CANDIDATES = [round(x, 2) for x in np.arange(1.0, -0.001, -0.05)]
+ALPHA_CANDIDATES = [1.0, 0.85, 0.70, 0.55, 0.40]   # 1.0 = NN only, fallback-safe
 
 
-# Pooling mode for the XGBoost branch's study-level features.
-#   "mean"  -- original behavior: one mean vector over every slice in the study.
-#   "multi" -- mean + max + std over all slices, plus a per-slot mean block.
-#
-# Why "multi" exists: a knee finding is usually focal. If a study has 150
-# slices and 3 show a torn ACL, averaging all 150 dilutes that evidence by
-# ~50x -- the mean vector barely moves. Max pooling preserves the strongest
-# single-slice response ("was this pattern present ANYWHERE"), std captures
-# how much the study varies slice-to-slice (uniform normal anatomy vs one
-# region that looks different), and the per-slot block keeps plane identity
-# instead of averaging sagittal/coronal/axial evidence together. Mean is
-# retained alongside them, so this strictly adds information rather than
-# trading one summary for another.
-#
-# Cost: feature width grows from EMBED_DIM to EMBED_DIM*(3+N_SLOT). PCA runs
-# immediately after and compresses back to PCA_COMPONENTS, so the XGBoost
-# input width is unchanged -- only the PCA fit sees the wider matrix.
-XGB_POOLING_MODE = os.environ.get("RSNA_XGB_POOLING", "multi").lower()
-
-
-def study_pooled_embedding(study, emb_df, mode=None, slot_map=None):
+def study_pooled_embedding(study, emb_df):
     """
-    Summarize one study's slice embeddings into a fixed-length vector.
+    Mean-pool ALL slice embeddings for one study across all present slots.
     Reuses the exact same cached .pt files the neural net loads — zero
     extra MedSigLIP forward passes needed.
-
-    mode="mean"  -> (EMBED_DIM,)                    [original behavior]
-    mode="multi" -> (EMBED_DIM * (3 + N_SLOT),)     [mean|max|std|per-slot means]
-
-    Returns (features, (N_SLOT,) presence mask).
+    Returns (EMBED_DIM,) vector + (N_SLOT,) presence mask.
     """
-    mode = (mode or XGB_POOLING_MODE)
-    # slot_map, when supplied by build_tabular_matrix, replaces a per-study
-    # linear scan of emb_df with a dict lookup (see build_slot_file_map).
-    if slot_map is None:
-        slot_map = build_slot_file_map(emb_df)
-    slot_to_file = slot_map.get(str(study), {})
+    rows = emb_df[emb_df["StudyInstanceUID"] == study]
+    slot_to_file = {r["slot_name"]: r["embedding_file"]
+                    for _, r in rows.iterrows() if r["presence_mask"] == 1}
+    tensors = []
     mask = np.zeros(N_SLOT, dtype=np.float32)
-
-    # Keep slices grouped BY SLOT (not flattened) so per-plane structure
-    # survives; the "mean" mode concatenates them back together to reproduce
-    # the original all-slices-pooled vector exactly.
-    per_slot = [None] * N_SLOT
     for s_idx, slot_name in enumerate(SLOT_NAMES):
         if slot_name in slot_to_file:
             try:
-                per_slot[s_idx] = load_embedding(slot_to_file[slot_name])
+                tensors.append(load_embedding(slot_to_file[slot_name]))
                 mask[s_idx] = 1.0
             except Exception:
                 pass
-
-    present = [t for t in per_slot if t is not None]
-    width = EMBED_DIM if mode == "mean" else EMBED_DIM * (3 + N_SLOT)
-    if not present:
-        return np.zeros(width, dtype=np.float32), mask
-
-    all_slices = torch.cat(present, dim=0)          # [n_slices, EMBED_DIM]
-    if mode == "mean":
-        return all_slices.mean(dim=0).numpy(), mask
-
-    g_mean = all_slices.mean(dim=0)
-    g_max  = all_slices.max(dim=0).values
-    # std over a single slice is undefined (returns NaN) -- fall back to zeros,
-    # which is the honest "no variability observed" value rather than a NaN
-    # that would silently poison PCA and every downstream tree.
-    g_std  = (all_slices.std(dim=0, unbiased=False)
-              if all_slices.shape[0] > 1 else torch.zeros(EMBED_DIM))
-
-    blocks = [g_mean, g_max, g_std]
-    for s_idx in range(N_SLOT):
-        t = per_slot[s_idx]
-        # Absent slot -> zeros. The presence mask is passed to the model
-        # separately (see make_features), so a tree can distinguish
-        # "slot missing" from "slot present but genuinely near-zero".
-        blocks.append(t.mean(dim=0) if t is not None else torch.zeros(EMBED_DIM))
-
-    feats = torch.cat(blocks, dim=0).numpy().astype(np.float32)
-    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    return feats, mask
+    if not tensors:
+        return np.zeros(EMBED_DIM, dtype=np.float32), mask
+    return torch.cat(tensors, dim=0).mean(dim=0).numpy(), mask
 
 
-def build_tabular_matrix(study_ids, emb_df, mode=None):
-    """[n, D] pooled embeddings + [n, N_SLOT] presence masks, in order.
-
-    D depends on the pooling mode (see study_pooled_embedding). Every caller
-    passes the resulting matrix straight into fit_pca/make_features, which are
-    dimension-agnostic, so widening D here needs no downstream changes.
-    """
-    slot_map = build_slot_file_map(emb_df)
+def build_tabular_matrix(study_ids, emb_df):
+    """[n, EMBED_DIM] pooled embeddings + [n, N_SLOT] presence masks, in order."""
     feats, masks = [], []
     for s in study_ids:
-        f, m = study_pooled_embedding(s, emb_df, mode=mode, slot_map=slot_map)
+        f, m = study_pooled_embedding(s, emb_df)
         feats.append(f)
         masks.append(m)
     return np.stack(feats).astype(np.float32), np.stack(masks).astype(np.float32)
@@ -2449,26 +1310,24 @@ def make_features(raw_embed, mask, pca, extra=None):
 def soft_label_weight(y_soft, is_real, conf=None):
     """
     Confidence weight per (study, target) pair.
-      Real (official) label -> weight 3.0, full trust.
-      Weak (parsed) label   -> weight 0.25 to 1.0, scaled by confidence.
+      Real (official) label -> 3.0, full trust.
+      Weak label with conf  -> scaled by the labeller's OWN confidence.
+      Weak label without    -> old fallback: distance from the undecided 0.5.
 
-    conf, when given, is the parser's own per-target __conf score (from
-    train_and_predict.py) -- this reflects how much actual evidence the
-    parser/learned-model blend found in the report text for that specific
-    target, and is strictly more informative than guessing confidence from
-    how far the soft label sits from 0.5. When conf is None (older-format
-    label CSV without __conf columns), falls back to the distance-from-0.5
-    proxy exactly as before.
+    FIX: the v2 label file reports confidence directly -- 0.95 when the report
+    asserts a finding, 0.85 when it denies it, 0.05 when the report never
+    mentions it. That is a far better weight than guessing from distance to
+    0.5, because an UNK sits at 0.28 and the old formula would read that as a
+    fairly confident negative when it actually means "no information".
     """
     if conf is not None:
-        conf_term = np.clip(conf, 0.0, 1.0)
+        w = np.where(is_real[:, None], 3.0, 0.15 + 1.05 * np.asarray(conf, dtype=np.float32).clip(0, 1))
     else:
-        conf_term = (2.0 * np.abs(y_soft - 0.5)).clip(0, 1)
-    w = np.where(
-        is_real[:, None],
-        3.0,
-        0.25 + 0.75 * conf_term,
-    )
+        w = np.where(
+            is_real[:, None],
+            3.0,
+            0.25 + 0.75 * (2.0 * np.abs(y_soft - 0.5)).clip(0, 1),
+        )
     return w.astype(np.float32)
 
 
@@ -2510,13 +1369,6 @@ def predict_xgb(models, X):
 def main():
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if REQUIRE_CUDA and device.type != "cuda":
-        raise SystemExit(
-            "RSNA_REQUIRE_CUDA=1 but CUDA is not available "
-            "(torch.cuda.is_available() returned False). Refusing to silently "
-            "fall back to CPU. Check the GPU/driver allocation before training."
-        )
-    print(f"Device: {device}")
     # local flag (not the module-level XGB_AVAILABLE) so any failure inside
     # main() can disable the stacking layer for this run only, cleanly
     xgb_ok = XGB_AVAILABLE
@@ -2528,55 +1380,64 @@ def main():
     print("=" * 60)
 
     # ── load labels: parser output, NOT train.csv ──────────────────
-    # Only required when we actually build a submission. On a training-only
-    # server run (RSNA_RUN_TEST_INFERENCE=0) test.csv often isn't present at
-    # all, and reading it here aborted the whole run before training started.
-    test_df = None
-    if RUN_TEST_INFERENCE:
-        test_df = pd.read_csv(DATA_ROOT / "test.csv")
+    test_df         = pd.read_csv(DATA_ROOT / "test.csv")
     test_series_csv  = DATA_ROOT / "test_series.csv"
     train_series_csv = DATA_ROOT / "train_series.csv"
 
     print(f"Using parsed labels: {PARSED_LABELS_CSV}")
     parsed = pd.read_csv(PARSED_LABELS_CSV, dtype={"StudyInstanceUID": str})
     parsed[TARGETS] = parsed[TARGETS].fillna(0)
-    if "is_real_label" not in parsed.columns:
-        raise RuntimeError(
-            f"{PARSED_LABELS_CSV} has no 'is_real_label' column — "
-            "run train_and_predict.py first to produce it."
-        )
 
+    # FIX: the v2 label file has no is_real_label column -- it is a pure
+    # report-derived file (score / __conf / __verdict per target). Deriving
+    # the flag from train.csv is safer than hard-failing: the 58 official
+    # studies are the ones with non-null labels there.
+    if "is_real_label" not in parsed.columns:
+        gold_ids = set()
+        _train_csv = DATA_ROOT / "train.csv"
+        if _train_csv.exists():
+            _t = pd.read_csv(_train_csv, dtype={"StudyInstanceUID": str})
+            _tt = [c for c in TARGETS if c in _t.columns]
+            if _tt:
+                gold_ids = set(_t.loc[_t[_tt].notna().any(axis=1),
+                                      "StudyInstanceUID"].astype(str))
+                # official 0/1 truth overrides the report guess for these
+                _g = _t[_t["StudyInstanceUID"].astype(str).isin(gold_ids)]
+                _g = _g.set_index("StudyInstanceUID")[_tt].astype(float)
+                parsed = parsed.set_index("StudyInstanceUID")
+                common = parsed.index.intersection(_g.index)
+                parsed.loc[common, _tt] = _g.loc[common, _tt].values
+                for c in _tt:
+                    if c + "__conf" in parsed.columns:
+                        parsed.loc[common, c + "__conf"] = 1.0
+                parsed = parsed.reset_index()
+        parsed["is_real_label"] = parsed["StudyInstanceUID"].astype(str).isin(gold_ids)
+        print(f"  No is_real_label column -- derived {len(gold_ids)} gold studies "
+              f"from train.csv and overrode their scores with official 0/1")
+
+    parsed["is_real_label"] = parsed["is_real_label"].astype(bool)
     real_df = parsed[parsed["is_real_label"]].copy()
     weak_df = parsed[~parsed["is_real_label"]].copy()
-    if STUDY_LIST_CSV:
-        study_list_path = Path(STUDY_LIST_CSV)
-        requested = pd.read_csv(study_list_path, dtype={"StudyInstanceUID": str})
-        if "StudyInstanceUID" not in requested.columns:
-            raise RuntimeError(f"{study_list_path} must contain StudyInstanceUID")
-        requested_ids = set(requested["StudyInstanceUID"].astype(str))
-        missing_requested = requested_ids - set(parsed["StudyInstanceUID"].astype(str))
-        if missing_requested:
-            raise RuntimeError(f"Study list contains {len(missing_requested)} IDs absent from labels")
-        parsed = parsed[parsed["StudyInstanceUID"].astype(str).isin(requested_ids)].copy()
-        real_df = parsed[parsed["is_real_label"]].copy()
-        weak_df = parsed[~parsed["is_real_label"]].copy()
-        if len(parsed) != N_TOTAL_STUDIES:
-            raise RuntimeError(f"Expected {N_TOTAL_STUDIES} studies from {study_list_path}, found {len(parsed)}")
-        print(f"Using explicit study list: {study_list_path}")
     print(f"Real-labeled studies (true 0/1): {len(real_df)}")
     print(f"Weak-labeled studies (parser)  : {len(weak_df)}")
 
+    # FIX: N_TOTAL_STUDIES defaults to 4407 now, so this uses every study
+    # instead of randomly discarding ~67 of them.
     n_weak_needed = max(0, N_TOTAL_STUDIES - len(real_df))
-    if n_weak_needed > len(weak_df):
-        print(f"[WARN] Only {len(weak_df)} weak-labeled studies available, "
-              f"wanted {n_weak_needed} — using all of them.")
-        n_weak_needed = len(weak_df)
-    weak_sample = weak_df.sample(n=n_weak_needed, random_state=SAMPLE_SEED)
+    if n_weak_needed >= len(weak_df):
+        weak_sample = weak_df
+    else:
+        weak_sample = weak_df.sample(n=n_weak_needed, random_state=SAMPLE_SEED)
 
     labeled = pd.concat([real_df, weak_sample], ignore_index=True)
     print(f"Training pool total            : {len(labeled)} "
           f"({len(real_df)} real + {len(weak_sample)} weak)")
-    print(f"Test studies    : {len(test_df) if test_df is not None else '(test inference disabled)'}")
+
+    # Per-target confidence straight from the labeller, when present.
+    CONF_COLS = [t + "__conf" for t in TARGETS]
+    HAS_CONF  = all(c in labeled.columns for c in CONF_COLS)
+    print(f"Per-target __conf columns      : {'yes' if HAS_CONF else 'no (fallback)'}")
+    print(f"Test studies    : {len(test_df)}")
 
     # ══ TRAIN PIPELINE ══════════════════════════════════════════
     if IS_KAGGLE:
@@ -2586,194 +1447,67 @@ def main():
         ensure_studies_unzipped(labeled["StudyInstanceUID"], TRAIN_SERIES, TRAIN_SERIES_ZIP)
 
     print("\n── TRAIN: Scan DICOMs ──")
-    # Cache filenames are fingerprinted by the actual study selection
-    # (N_TOTAL_STUDIES, plus the study-list CSV path if one is set) so that
-    # changing RSNA_N_TOTAL_STUDIES (e.g. 1000 -> 4349) gets its own fresh
-    # cache set instead of silently reusing train_dicom_index.csv /
-    # train_slots_cache.pkl / train_embedding_index.csv left over from a
-    # prior run with a different study count under the same fixed filename.
-    _study_set_tag = f"n{N_TOTAL_STUDIES}"
-    if STUDY_LIST_CSV:
-        _study_set_tag += "_" + Path(STUDY_LIST_CSV).stem
-    # The DICOM index and slot cache describe which files exist and how series
-    # map to slots -- neither depends on SLICE_MODE, and the DICOM header scan
-    # is by far the slowest step (185k files), so they stay on the shared tag
-    # and are NOT re-run when switching 2D <-> 2.5D.
-    _cached_dcm_idx = WORK_DIR / f"train_dicom_index_{_study_set_tag}.csv"
-    _cached_slots   = WORK_DIR / f"train_slots_cache_{_study_set_tag}.pkl"
-    # Embeddings DO depend on SLICE_MODE (it changes the encoder's input), so
-    # the embedding index carries the mode in its tag. Each mode keeps its own
-    # embedding set rather than one silently overwriting or reusing the other.
-    _emb_tag = _study_set_tag + ("_25d" if SLICE_MODE == "2.5d" else "")
-    _cached_emb_idx = WORK_DIR / f"train_embedding_index_{_emb_tag}.csv"
+    _cached_dcm_idx = WORK_DIR / "train_dicom_index.csv"
+    _cached_emb_idx = WORK_DIR / "train_embedding_index.csv"
 
-    # POOL FRESHNESS: medsiglip_finetuned_vision.pt / stage_a_pretrained.pt /
-    # fold_*.pt / xgb_*.pkl / oof_predictions.csv are all fit against a
-    # *specific* training pool (N_TOTAL_STUDIES + SAMPLE_SEED). Unlike the
-    # DICOM/slots/embedding-index caches above, these checkpoints still use
-    # fixed filenames with no pool tag -- so re-running with a different
-    # N_TOTAL_STUDIES (e.g. 1000 -> 4349) silently kept "skipping" Stage
-    # A0/A/B and reusing checkpoints trained on the OLD, smaller pool, even
-    # though the run banner correctly reported the new pool size.
-    # check_embedding_cache_freshness() below only guards against the
-    # *encoder* changing (mtime/size of medsiglip_finetuned_vision.pt) --
-    # it can't catch this, since the encoder file itself doesn't change
-    # when Stage A0 was skipped. Guard separately here by stamping the pool
-    # tag next to the checkpoints and wiping them if it doesn't match.
-    # TWO SEPARATE SIGNATURES, because the artifacts have genuinely different
-    # dependencies and collapsing them into one wastes hours of GPU time:
-    #
-    #   ENCODER signature = pool + SLICE_MODE
-    #     Governs medsiglip_finetuned_vision.pt (Stage A0, ~3h). The encoder is
-    #     fine-tuned on raw pixels; it has no idea the downstream NN exists, so
-    #     SEQ_MODEL cannot affect it. It IS affected by SLICE_MODE, since
-    #     _study_images_for_finetune() builds its training images through the
-    #     same build_slice_images() path.
-    #
-    #   MODEL signature = encoder signature + SEQ_MODEL
-    #     Governs the NN/XGBoost checkpoints, which sit downstream of the
-    #     embeddings and DO change shape when the GRU is added.
-    #
-    # Net effect: RSNA_SEQ_MODEL=gru reuses the existing fine-tuned encoder and
-    # only retrains the cheap downstream stages.
-    _enc_sig_path  = MODEL_DIR / "encoder_signature.txt"
-    _pool_sig_path = MODEL_DIR / "training_pool_signature.txt"
-    # The fold-safety flags change WHICH STUDIES each stage trains on, so they
-    # must be part of the cache signature. Without this, turning fold safety on
-    # would happily "skip Stage A0/A -- checkpoint exists" and reuse the exact
-    # contaminated weights the flags exist to avoid.
-    _enc_tag = f"{_study_set_tag}_slice{SLICE_MODE}_a0gold{int(not EXCLUDE_GOLD_FROM_STAGE_A0)}"
-    _run_tag = (f"{_enc_tag}_seq{SEQ_MODEL}_pos{int(POS_EMB)}"
-                f"_agold{int(not EXCLUDE_GOLD_FROM_STAGE_A)}"
-                f"_fse{int(FOLD_SAFE_EPOCH_SELECT)}")
+    # FIX: every cached artifact below was produced by the OLD slot config,
+    # the OLD per-slice windowing and the broken laterality path, so reusing
+    # any of it would silently keep the bugs alive. RSNA_FORCE_RESCAN=1
+    # deletes them and rebuilds from the DICOMs.
+    if os.environ.get("RSNA_FORCE_RESCAN", "0") == "1":
+        print("\n  RSNA_FORCE_RESCAN=1 -- clearing cached scan/slot/embedding artifacts")
+        for _p in [_cached_dcm_idx, _cached_emb_idx,
+                   WORK_DIR / "train_slots_cache.pkl",
+                   WORK_DIR / "test_slots_cache.pkl",
+                   WORK_DIR / "test_dicom_index.csv",
+                   WORK_DIR / "test_embedding_index.csv"]:
+            if _p.exists():
+                _p.unlink(); print(f"    removed {_p.name}")
+        for _d in [EMB_DIR / "train", EMB_DIR / "test"]:
+            if _d.exists():
+                shutil.rmtree(_d, ignore_errors=True); print(f"    removed {_d}")
+        if os.environ.get("RSNA_FORCE_RETRAIN", "1") == "1":
+            for _p in list(MODEL_DIR.glob("*.pt")) + list(MODEL_DIR.glob("*.pkl")):
+                _p.unlink(); print(f"    removed {_p.name}")
 
-    _prev_enc_tag  = _enc_sig_path.read_text().strip()  if _enc_sig_path.exists()  else None
-    _prev_pool_tag = _pool_sig_path.read_text().strip() if _pool_sig_path.exists() else None
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── encoder-level invalidation (expensive: forces Stage A0 to re-run) ──
-    _enc_ckpt = MODEL_DIR / "medsiglip_finetuned_vision.pt"
-    if _prev_enc_tag is not None and _prev_enc_tag != _enc_tag and _enc_ckpt.exists():
-        if KEEP_FINETUNED_ENCODER:
-            print(f"  [CACHE] Encoder config changed ({_prev_enc_tag} -> {_enc_tag}) but "
-                  f"RSNA_KEEP_ENCODER=1 — keeping the existing fine-tuned MedSigLIP.\n"
-                  f"          NOTE: it was fine-tuned under '{_prev_enc_tag}'. Embeddings "
-                  f"will still be regenerated with it under the new config, so the encoder "
-                  f"is adapted to a slightly different input than it now sees. Deliberate "
-                  f"trade-off: saves the Stage A0 re-run, at some loss of adaptation match.")
-        else:
-            _enc_ckpt.unlink()
-            print(f"  [CACHE] Encoder config changed ({_prev_enc_tag} -> {_enc_tag}) — "
-                  f"removed medsiglip_finetuned_vision.pt; Stage A0 will re-run. "
-                  f"(Set RSNA_KEEP_ENCODER=1 to reuse it instead and skip that cost.)")
-    _enc_sig_path.write_text(_enc_tag)
-
-    # ── model-level invalidation (cheap: downstream of the embedding cache) ──
-    if _prev_pool_tag != _run_tag:
-        _pool_stale = [
-            MODEL_DIR / "stage_a_pretrained.pt",
-            MODEL_DIR / "stage0_mrnet_pretrained.pt",
-            MODEL_DIR / "xgb_stage_a.pkl",
-            MODEL_DIR / "oof_predictions.csv",
-        ]
-        _pool_stale.extend(MODEL_DIR.glob("stage_a_fold_*.pt"))
-        _pool_stale.extend(MODEL_DIR.glob("fold_*.pt"))
-        _pool_stale.extend(MODEL_DIR.glob("xgb_fold_*.pkl"))
-        _pool_removed = []
-        for _sp in sorted(set(_pool_stale), key=lambda p: str(p)):
-            if _sp.exists():
-                _sp.unlink()
-                _pool_removed.append(_sp.name)
-        _pool_sig_path.write_text(_run_tag)
-        if _pool_removed:
-            print(f"  [CACHE] Model configuration changed ({_prev_pool_tag or 'unrecorded/legacy'} -> "
-                  f"{_run_tag}) — invalidated {len(_pool_removed)} config-dependent "
-                  f"checkpoint(s): {_pool_removed}")
-
-    if FORCE_RESCAN:
-        print("  RSNA_FORCE_RESCAN=1 — deleting cached DICOM index / slots / "
-              "embedding index, rebuilding from scratch this run")
-        for _f in (_cached_dcm_idx, _cached_slots, _cached_emb_idx):
-            if _f.exists():
-                _f.unlink()
-                print(f"    removed {_f}")
-
-    # DICOM index + slot assignment are needed both for embedding AND for
-    # Stage A0 MedSigLIP fine-tuning below (which reads raw pixels directly,
-    # bypassing any cached embeddings) -- so these load/compute
-    # unconditionally, decoupled from the embedding-specific cache check
-    # that follows. Previously these two caches were bundled into one
-    # skip-check, which meant train_dcm/train_slots were only ever computed
-    # when embeddings did NOT already exist -- fine before Stage A0 existed,
-    # but Stage A0 needs raw DICOM access even on a machine that already has
-    # cached embeddings from a prior stock-encoder run.
-    if _cached_dcm_idx.exists():
-        print(f"  Reusing cached DICOM index: {_cached_dcm_idx}")
-        train_dcm = pd.read_csv(_cached_dcm_idx, dtype=str)
-    else:
-        train_study_filter = set(labeled["StudyInstanceUID"].astype(str).tolist())
-        train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=train_study_filter)
-        train_dcm.to_csv(_cached_dcm_idx, index=False)
-
-    print("\n── TRAIN: Build slots ──")
-    if _cached_slots.exists():
-        print(f"  Reusing cached slots: {_cached_slots}")
-        with open(_cached_slots, "rb") as f:
-            train_slots, train_lat = pickle.load(f)
-    else:
-        train_lat   = detect_laterality(train_dcm)
-        train_slots = assign_slots(train_dcm)
-        train_slots["laterality"] = train_slots["StudyInstanceUID"].map(train_lat)
-        with open(_cached_slots, "wb") as f:
-            pickle.dump((train_slots, train_lat), f)
-        print(f"  Cached slots to: {_cached_slots}")
-
-    # ══ STAGE A0 — FINE-TUNE MEDSIGLIP ITSELF (run once; the checkpoint it
-    # saves makes MedSigLIP a fixed, better-adapted function again, so every
-    # stage after this returns to full cached speed automatically) ══
-    if RUN_STAGE_A0_FINETUNE:
-        _a0_pool = (set(labeled["StudyInstanceUID"].astype(str)) &
-                    set(train_slots["StudyInstanceUID"].astype(str)))
-        if EXCLUDE_GOLD_FROM_STAGE_A0:
-            _gold_all = set(real_df["StudyInstanceUID"].astype(str))
-            _dropped = _a0_pool & _gold_all
-            _a0_pool -= _gold_all
-            print(f"  [FOLD-SAFE] Stage A0 excludes {len(_dropped)} gold studies "
-                  f"({len(_a0_pool)} weak studies remain). The encoder is shared by "
-                  f"every fold, so training it on gold labels contaminates all of "
-                  f"them irreversibly. Set RSNA_A0_EXCLUDE_GOLD=0 to disable.")
-        finetune_pool_ids = np.array(sorted(_a0_pool))
-        finetune_medsiglip_stage_a0(
-            finetune_pool_ids, labeled, train_dcm, train_slots, train_lat,
-            device.type, train_last_blocks=MEDSIGLIP_FINETUNE_BLOCKS,
-            epochs=MEDSIGLIP_FINETUNE_EPOCHS,
-        )
-
-    # The encoder may have just changed (first fine-tune, or a different
-    # checkpoint swapped in since the last run) -- auto-invalidate stale
-    # cached embeddings rather than risk silently mixing embeddings
-    # produced by two different encoders.
-    check_embedding_cache_freshness(WORK_DIR)
-
-    if _cached_emb_idx.exists():
-        print("  Found existing embedding index — skipping embed step")
+    if _cached_dcm_idx.exists() and _cached_emb_idx.exists():
+        print("  Found existing DICOM + embedding index — skipping scan/slot/embed steps")
+        train_dcm     = pd.read_csv(_cached_dcm_idx, dtype=str)
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
-        # dtype=str above forces presence_mask to the STRING "0"/"1". Every
-        # downstream consumer (StudyDataset.get, study_pooled_embedding,
-        # _study_images_for_finetune) checks `presence_mask == 1` against
-        # the int 1 -- "1" == 1 is False in Python (no error, just silently
-        # False), so EVERY slot on EVERY study reads as absent and training
-        # runs on all-empty/zero-padded inputs, collapsing AUC to ~0.5.
-        # Restore the real dtype so those comparisons work as intended.
-        train_emb_idx["presence_mask"] = train_emb_idx["presence_mask"].astype(int)
+        if "centre_x" not in train_dcm.columns:
+            raise RuntimeError(
+                "Cached train_dicom_index.csv predates the geometry fix (no "
+                "centre_x column). Re-run with RSNA_FORCE_RESCAN=1.")
     else:
+        if _cached_dcm_idx.exists():
+            print(f"  Reusing cached DICOM index: {_cached_dcm_idx}")
+            train_dcm = pd.read_csv(_cached_dcm_idx, dtype=str)
+        else:
+            train_study_filter = set(labeled["StudyInstanceUID"].astype(str).tolist())
+            train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=train_study_filter)
+            train_dcm.to_csv(_cached_dcm_idx, index=False)
+
+        print("\n── TRAIN: Build slots ──")
+        _cached_slots = WORK_DIR / "train_slots_cache.pkl"
+        if _cached_slots.exists():
+            print(f"  Reusing cached slots: {_cached_slots}")
+            with open(_cached_slots, "rb") as f:
+                train_slots, train_lat = pickle.load(f)
+        else:
+            train_lat   = detect_laterality(train_dcm)
+            train_slots = assign_slots(train_dcm)
+            train_slots["laterality"] = train_slots["StudyInstanceUID"].map(train_lat)
+            with open(_cached_slots, "wb") as f:
+                pickle.dump((train_slots, train_lat), f)
+            print(f"  Cached slots to: {_cached_slots}")
+
         print("\n── TRAIN: Embed ──")
         processor, model_enc, device_enc = load_medsiglip()
         train_emb_idx = embed_slots(train_slots, train_dcm, processor, model_enc,
                                      device_enc, train_lat, EMB_DIR / "train")
-        train_emb_idx.to_csv(_cached_emb_idx, index=False)
-        if "model_enc" in dir(): del model_enc
-        torch.cuda.empty_cache()
+        train_emb_idx.to_csv(WORK_DIR / "train_embedding_index.csv", index=False)
+    if "model_enc" in dir(): del model_enc
+    torch.cuda.empty_cache()
 
     # ══ STAGE A — PRETRAIN ON WEAK LABELS (all 4340: 58 real + weak) ═══
     print("\n── STAGE A: Pretrain on weak labels (4340 studies) ──")
@@ -2790,20 +1524,9 @@ def main():
     emb = train_emb_idx[train_emb_idx["StudyInstanceUID"].astype(str).isin(common)].copy()
 
     real_ids_common = set(real_df["StudyInstanceUID"].astype(str)) & common
-    if EXCLUDE_GOLD_FROM_STAGE_A:
-        pretrain_ids = np.array(sorted(common - real_ids_common))
-        print(f"  [FOLD-SAFE] Stage A excludes the {len(real_ids_common)} gold studies. "
-              f"Its best fold seeds every Stage B fold, so training it on gold means "
-              f"each Stage B model starts from weights that already saw its own "
-              f"validation studies. Set RSNA_A_EXCLUDE_GOLD=0 to disable.")
-    else:
-        pretrain_ids = np.array(sorted(common))
+    pretrain_ids = np.array(sorted(common))
     print(f"Pretrain pool: {len(pretrain_ids)} studies "
-          f"({len(set(pretrain_ids) & real_ids_common)} of them real-labeled)")
-    if len(pretrain_ids) < 10:
-        raise RuntimeError(
-            f"Stage A pool collapsed to {len(pretrain_ids)} studies. Check that the "
-            f"weak-labeled studies actually have embeddings.")
+          f"({len(real_ids_common)} of them real-labeled)")
 
     # Stage A: 5-fold CV on all weak+real studies
     # Best fold model (highest val AUC) used as starting point for Stage B
@@ -2821,128 +1544,6 @@ def main():
         best_stage_a_auc = None
     else:
         print(f"Stage A: 5-fold CV on {len(pretrain_ids)} studies")
-
-        # ══ STAGE 0 — MRNet auxiliary ACL pretraining (optional) ══════
-        # Only runs here, inside the branch where Stage A is actually
-        # about to train -- if Stage A were already cached (the `if`
-        # branch above), Stage 0's output would never be consumed, so
-        # there's no reason to spend the time computing it.
-        stage0_state_dict = None
-        stage0_path = MODEL_DIR / "stage0_mrnet_pretrained.pt"
-        # Stage 0 can draw on two independent external ACL sources: MRNet
-        # (Stanford) and KneeMRI (Rijeka). Both are embedded through the SAME
-        # MedSigLIP + encode_images() path as our own data, and both feed the
-        # same ACL-masked trainer, so they are simply concatenated into one
-        # pretraining pool rather than run as two separate stages. Whichever
-        # roots exist get used; if neither does, Stage 0 skips as before.
-        if RUN_MRNET_PRETRAIN or RUN_KNEEMRI_PRETRAIN:
-            _sources = ([f"MRNet({MRNET_ROOT})"] if RUN_MRNET_PRETRAIN else []) + \
-                        ([f"KneeMRI({KNEEMRI_ROOT})"] if RUN_KNEEMRI_PRETRAIN else [])
-            print(f"\n── STAGE 0: external ACL pretraining — {', '.join(_sources)} ──")
-            if stage0_path.exists():
-                print(f"  Found existing checkpoint at {stage0_path} — skipping Stage 0 training")
-                stage0_ckpt = torch.load(stage0_path, map_location=device, weights_only=False)
-                stage0_state_dict = stage0_ckpt["model_state_dict"]
-            else:
-                try:
-                    _ext_emb_parts, _ext_lbl_parts = [], []
-                    _stage0_encoder = None   # loaded lazily, reused by both sources
-
-                    if RUN_MRNET_PRETRAIN:
-                        mrnet_labels = load_mrnet_labels(MRNET_ROOT)
-                        _mrnet_cached_emb_idx = MRNET_EMB_DIR / "mrnet_embedding_index.csv"
-                        if _mrnet_cached_emb_idx.exists():
-                            print("  Found existing MRNet embedding index — skipping embed step")
-                            mrnet_emb_idx = pd.read_csv(_mrnet_cached_emb_idx, dtype=str)
-                            # Same dtype=str/presence_mask string-vs-int bug as the
-                            # main train_emb_idx reload above -- restore real dtype.
-                            mrnet_emb_idx["presence_mask"] = mrnet_emb_idx["presence_mask"].astype(int)
-                        else:
-                            if _stage0_encoder is None:
-                                _stage0_encoder = load_medsiglip()
-                            _p, _m, _d = _stage0_encoder
-                            mrnet_emb_idx = embed_mrnet(MRNET_ROOT, mrnet_labels, _p, _m, _d,
-                                                        MRNET_EMB_DIR)
-                            mrnet_emb_idx.to_csv(_mrnet_cached_emb_idx, index=False)
-                        # normalize to the shared [study_id, label] shape
-                        _mrnet_lbl = pd.DataFrame({
-                            "study_id": mrnet_labels.apply(
-                                lambda r: f"mrnet_{r['split']}_{r['id']}", axis=1),
-                            "label": mrnet_labels["label"].astype(float)})
-                        _ext_emb_parts.append(mrnet_emb_idx)
-                        _ext_lbl_parts.append(_mrnet_lbl)
-
-                    if RUN_KNEEMRI_PRETRAIN:
-                        kneemri_labels = load_kneemri_labels(KNEEMRI_ROOT)
-                        # Embedding cache is tagged by the options that change
-                        # what the encoder actually sees, so switching ROI mode
-                        # or slice mode does not silently reuse the other's
-                        # embeddings.
-                        _km_tag = f"{KNEEMRI_ROI_MODE}_{SLICE_MODE}"
-                        _km_cached_emb_idx = KNEEMRI_EMB_DIR / f"kneemri_embedding_index_{_km_tag}.csv"
-                        _km_out_dir = KNEEMRI_EMB_DIR / _km_tag
-                        if _km_cached_emb_idx.exists():
-                            print("  Found existing KneeMRI embedding index — skipping embed step")
-                            kneemri_emb_idx = pd.read_csv(_km_cached_emb_idx, dtype=str)
-                            kneemri_emb_idx["presence_mask"] = kneemri_emb_idx["presence_mask"].astype(int)
-                        else:
-                            if _stage0_encoder is None:
-                                _stage0_encoder = load_medsiglip()
-                            _p, _m, _d = _stage0_encoder
-                            kneemri_emb_idx = embed_kneemri(kneemri_labels, _p, _m, _d, _km_out_dir)
-                            _km_cached_emb_idx.parent.mkdir(parents=True, exist_ok=True)
-                            kneemri_emb_idx.to_csv(_km_cached_emb_idx, index=False)
-                        _ext_emb_parts.append(kneemri_emb_idx)
-                        _ext_lbl_parts.append(kneemri_labels[["study_id", "label"]])
-
-                    if _stage0_encoder is not None:
-                        del _stage0_encoder
-                        torch.cuda.empty_cache()
-
-                    ext_emb_idx = pd.concat(_ext_emb_parts, ignore_index=True)
-                    ext_labels  = pd.concat(_ext_lbl_parts, ignore_index=True)
-                    print(f"  Stage 0 pool: {ext_labels['study_id'].nunique()} exams "
-                          f"across {len(_ext_lbl_parts)} source(s), "
-                          f"{int(ext_labels['label'].sum())} ACL-positive")
-
-                    stage0_model = train_stage0_mrnet(ext_emb_idx, ext_labels, device)
-                    if stage0_model is not None:
-                        stage0_state_dict = stage0_model.state_dict()
-                        torch.save({"model_state_dict": stage0_state_dict,
-                                    "targets": TARGETS, "slot_names": SLOT_NAMES,
-                                    "embed_dim": EMBED_DIM, "proj_dim": PROJ_DIM}, stage0_path)
-                        print(f"  Saved Stage 0 weights: {stage0_path}")
-                except Exception as e:
-                    print(f"  [WARN] Stage 0 external pretraining failed ({e}) — "
-                          "Stage A will use random initialization as before.")
-                    stage0_state_dict = None
-        else:
-            print(f"\n── STAGE 0: skipped (no external dataset found; "
-                  f"MRNET_ROOT={MRNET_ROOT}, KNEEMRI_ROOT={KNEEMRI_ROOT}) ──")
-
-        # Per-target confidence weights for the neural Stage A, built from the
-        # same soft_label_weight() the XGBoost branch uses so the two halves of
-        # the ensemble agree about how much each weak label is worth.
-        stage_a_weight_map = None
-        try:
-            _wl  = lbl.set_index("StudyInstanceUID").reindex(pretrain_ids)
-            _ys  = np.nan_to_num(_wl[TARGETS].to_numpy(dtype=np.float32))
-            _isr = np.array([sid in real_ids_common for sid in pretrain_ids])
-            _cc  = [f"{t}__conf" for t in TARGETS]
-            _cf  = (np.nan_to_num(_wl[_cc].to_numpy(dtype=np.float32))
-                    if all(c in lbl.columns for c in _cc) else None)
-            _W = soft_label_weight(_ys, _isr, conf=_cf)
-            # Normalize each target column to mean 1, so the overall loss scale
-            # (and therefore the effective learning rate) does not shift with how
-            # confident the parser happened to be on this particular pool.
-            _W = _W / np.maximum(_W.mean(axis=0, keepdims=True), 1e-6)
-            stage_a_weight_map = {str(sid): _W[i] for i, sid in enumerate(pretrain_ids)}
-            print(f"  Stage A: per-target confidence weighting ON "
-                  f"({'parser __conf columns' if _cf is not None else 'distance-from-0.5 fallback'})")
-        except Exception as e:
-            print(f"  [WARN] Could not build Stage A confidence weights ({e}) — "
-                  f"training unweighted, as before.")
-
         stage_a_table  = pd.DataFrame({"study": pretrain_ids})
         stage_a_gkf    = GroupKFold(n_splits=5)
         stage_a_models = []
@@ -2960,9 +1561,7 @@ def main():
                                       lbl[lbl["StudyInstanceUID"].isin(sa_va_ids)])
             print(f"\nStage A FOLD {sa_fold}  train={len(pre_tr_ds)}  val={len(pre_va_ds)}")
 
-            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30,
-                                   init_state_dict=stage0_state_dict,
-                                   weight_map=stage_a_weight_map)
+            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30)
 
             # evaluate this fold
             sa_model.eval()
@@ -3009,39 +1608,20 @@ def main():
             print(f"  PCA: {raw_embed.shape[1]} -> {xgb_pca.n_components_} dims "
                   f"(explained var {xgb_pca.explained_variance_ratio_.sum():.2%})")
 
-            Y_pool = lbl.set_index("StudyInstanceUID").loc[pretrain_ids, TARGETS].values.astype(np.float32)
+            _li = lbl.set_index("StudyInstanceUID")
+            Y_pool = _li.loc[pretrain_ids, TARGETS].values.astype(np.float32)
             is_real_pool = np.array([sid in real_ids_common for sid in pretrain_ids])
-            conf_cols = [f"{t}__conf" for t in TARGETS]
-            if all(c in lbl.columns for c in conf_cols):
-                conf_pool = lbl.set_index("StudyInstanceUID").loc[pretrain_ids, conf_cols].values.astype(np.float32)
-                print("  Using parser __conf columns for weak-label sample weighting")
-            else:
-                conf_pool = None
-                print("  [WARN] __conf columns not found in labels CSV — "
-                      "falling back to distance-from-0.5 weighting")
-            W_pool = soft_label_weight(Y_pool, is_real_pool, conf=conf_pool)
+            # FIX: feed the labeller's own per-target confidence when the file has it
+            _cc = [t + "__conf" for t in TARGETS]
+            C_pool = (_li.loc[pretrain_ids, _cc].values.astype(np.float32)
+                      if all(c in _li.columns for c in _cc) else None)
+            W_pool = soft_label_weight(Y_pool, is_real_pool, conf=C_pool)
             X_pool = make_features(raw_embed, presence, xgb_pca)
 
-            # A cached xgb_stage_a.pkl holds a PCA fitted at whatever feature
-            # width was in use when it was saved. Changing RSNA_XGB_POOLING
-            # (mean <-> multi) changes that width (EMBED_DIM vs
-            # EMBED_DIM*(3+N_SLOT)), so a stale PCA would either raise inside
-            # transform() or -- worse -- be silently mismatched. Detect the
-            # width change and retrain instead of reusing.
-            _cached_stage_a_usable = xgb_stage_a_path.exists()
-            if _cached_stage_a_usable:
+            if xgb_stage_a_path.exists():
+                print(f"  Found existing checkpoint at {xgb_stage_a_path} — skipping Stage A XGBoost training")
                 with open(xgb_stage_a_path, "rb") as f:
                     saved = pickle.load(f)
-                _saved_width = getattr(saved.get("pca"), "n_features_in_", None)
-                if _saved_width is not None and _saved_width != raw_embed.shape[1]:
-                    print(f"  [CACHE] {xgb_stage_a_path.name} was fit on "
-                          f"{_saved_width}-dim features but current pooling mode "
-                          f"('{XGB_POOLING_MODE}') produces {raw_embed.shape[1]} — "
-                          f"retraining Stage A XGBoost instead of reusing it")
-                    _cached_stage_a_usable = False
-
-            if _cached_stage_a_usable:
-                print(f"  Found existing checkpoint at {xgb_stage_a_path} — skipping Stage A XGBoost training")
                 xgb_pca            = saved["pca"]
                 xgb_stage_a_models = saved["fold_models"]
                 stage_a_xgb_oof    = saved["oof"]
@@ -3080,14 +1660,6 @@ def main():
     n_splits = min(5, len(ids))
     gkf      = GroupKFold(n_splits=n_splits)
     oof      = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
-    # Materialize the split ONCE. The resume path used to rebuild XGBoost OOF
-    # without it and wrote every fold's predictions over every row (see below),
-    # and the alpha search needs it to avoid tuning the blend on the same rows
-    # it scores. Also lets us assert NN and XGBoost share identical folds.
-    fold_splits  = list(gkf.split(table, groups=table.study))
-    fold_assign  = np.zeros(len(ids), dtype=int)
-    for _f, (_tri, _vi) in enumerate(fold_splits, 1):
-        fold_assign[_vi] = _f
 
     # ── XGBoost Stage B: build features once, train per-fold inside the loop below ──
     xgb_stage_b_models = []
@@ -3095,25 +1667,11 @@ def main():
     if xgb_ok and xgb_pca is not None:
         try:
             raw_embed_b, presence_b = build_tabular_matrix(ids, real_emb)
-            # Stage A XGBoost predictions as meta-features -- the actual
-            # "stacking" part: Stage B trees get to see what the Stage A model
-            # (trained on the weak pool) thought about each gold study.
-            #
-            # Under fold safety the gold studies are not in pretrain_ids at all,
-            # so there is no OOF row for them. That is the clean case: NO Stage A
-            # fold ever saw a gold study, so simply averaging the fold models'
-            # predictions on gold is already out-of-sample. When gold IS in the
-            # pool (RSNA_A_EXCLUDE_GOLD=0) fall back to its OOF row, which is the
-            # only non-leaky option there.
+            # Stage A XGBoost OOF predictions, reordered to match `ids`, used as
+            # meta-features — this is the actual "stacking" part: Stage B trees
+            # get to see what the Stage A model (trained 4340 studies) thought.
             pretrain_pos = {sid: i for i, sid in enumerate(pretrain_ids)}
-            if all(sid in pretrain_pos for sid in ids):
-                meta_b = np.stack([stage_a_xgb_oof[pretrain_pos[sid]]
-                                   for sid in ids]).astype(np.float32)
-            else:
-                X_stage_a_gold = make_features(raw_embed_b, presence_b, xgb_pca)
-                meta_b = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
-                for _fm in xgb_stage_a_models:
-                    meta_b += predict_xgb(_fm, X_stage_a_gold) / len(xgb_stage_a_models)
+            meta_b = np.stack([stage_a_xgb_oof[pretrain_pos[sid]] for sid in ids]).astype(np.float32)
             X_stage_b = make_features(raw_embed_b, presence_b, xgb_pca, extra=meta_b)
             Y_stage_b = real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32)
             xgb_oof   = np.zeros((len(ids), len(TARGETS)), dtype=np.float32)
@@ -3150,21 +1708,13 @@ def main():
         # load XGBoost folds if available
         if xgb_ok and xgb_oof is not None and _all_xgb_exist:
             try:
-                # BUGFIX: this used to be
-                #   xgb_oof[[i for i,s in enumerate(ids) if s in ids]] =
-                #       predict_xgb(fold_models, X_stage_b[[i for i,_ in enumerate(ids)]])
-                # `s in ids` is True for every row, so each fold's model predicted
-                # on ALL 58 studies -- including its own training studies -- and
-                # overwrote the whole array. The surviving xgb_oof was fold 5's
-                # in-sample fit on everything. That inflated the XGBoost-only AUC,
-                # which then drove the alpha search, which then set the blend used
-                # for the actual submission. Restrict each fold to its own
-                # validation rows, exactly as the training path does.
-                for fold, (_tri, _vi) in enumerate(fold_splits, 1):
+                for fold in range(1, n_splits+1):
                     with open(MODEL_DIR / f"xgb_fold_{fold}.pkl", "rb") as f:
                         fold_xgb_models = pickle.load(f)
                     xgb_stage_b_models.append(fold_xgb_models)
-                    xgb_oof[_vi] = predict_xgb(fold_xgb_models, X_stage_b[_vi])
+                    xgb_oof[np.array([i for i, s in enumerate(ids)
+                                      if s in ids])] = predict_xgb(fold_xgb_models,
+                                      X_stage_b[[i for i,_ in enumerate(ids)]])
                 print(f"  Loaded {len(xgb_stage_b_models)} XGBoost fold checkpoints")
             except Exception as e:
                 print(f"[WARN] XGBoost load failed ({e}) — NN-only for blend")
@@ -3172,35 +1722,13 @@ def main():
 
     else:
         # ── normal training loop ──────────────────────────────────────────────
-        for fold, (tri, vi) in enumerate(fold_splits, 1):
+        for fold, (tri, vi) in enumerate(gkf.split(table, groups=table.study), 1):
             fold_ckpt_path = MODEL_DIR / f"fold_{fold}.pt"
             tr_fold_ids = ids[tri]; va_fold_ids = ids[vi]
-
-            # Split an inner selection set out of the TRAINING fold, and choose
-            # the epoch on that. Previously the epoch was chosen by scoring
-            # va_fold_ids -- the very rows about to be reported as out-of-fold --
-            # so `oof` was the best of 15 draws against its own answer key.
-            sel_fold_ids = None
-            if FOLD_SAFE_EPOCH_SELECT:
-                _rng = np.random.RandomState(SAMPLE_SEED + fold)
-                _perm = _rng.permutation(len(tr_fold_ids))
-                _n_sel = int(round(len(tr_fold_ids) * INNER_SELECT_FRAC))
-                # Need at least 2 studies to compute an AUC at all; if the fold is
-                # too small to spare them, fall back to last-epoch weights rather
-                # than quietly reintroducing the leak.
-                if _n_sel >= 2 and len(tr_fold_ids) - _n_sel >= 4:
-                    sel_fold_ids = tr_fold_ids[_perm[:_n_sel]]
-                    tr_fold_ids  = tr_fold_ids[_perm[_n_sel:]]
-
             tr_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(tr_fold_ids)],
                                   real_lbl[real_lbl["StudyInstanceUID"].isin(tr_fold_ids)])
             va_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(va_fold_ids)],
                                   real_lbl[real_lbl["StudyInstanceUID"].isin(va_fold_ids)])
-            if sel_fold_ids is not None:
-                sel_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(sel_fold_ids)],
-                                       real_lbl[real_lbl["StudyInstanceUID"].isin(sel_fold_ids)])
-            else:
-                sel_ds = None
 
             if fold_ckpt_path.exists():
                 print(f"\nFOLD {fold}  — checkpoint already exists, loading and skipping training")
@@ -3208,20 +1736,10 @@ def main():
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, ckpt["model_state_dict"])
             else:
-                print(f"\nFOLD {fold}  train={len(tr_ds)}  "
-                      f"select={len(sel_ds) if sel_ds is not None else 0}  val={len(va_ds)}")
+                print(f"\nFOLD {fold}  train={len(tr_ds)}  val={len(va_ds)}")
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, pretrained_model.state_dict())
-                if sel_ds is not None:
-                    # Monitor + select on the inner split; va_ds stays untouched.
-                    fold_model = finetune_fold(fold_model, tr_ds, sel_ds, device,
-                                               epochs=15, lr=2e-5, select_on_val=True)
-                else:
-                    # No inner split available -- keep the last epoch rather than
-                    # peeking at va_ds to pick one.
-                    fold_model = finetune_fold(fold_model, tr_ds, va_ds, device,
-                                               epochs=15, lr=2e-5,
-                                               select_on_val=not FOLD_SAFE_EPOCH_SELECT)
+                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, lr=2e-5)
 
             fold_model.eval()
             Y, P = [], []
@@ -3265,14 +1783,7 @@ def main():
         oof_df = pd.DataFrame(oof, columns=TARGETS)
         oof_df.insert(0, "StudyInstanceUID", ids)
         oof_df.to_csv(MODEL_DIR / "oof_predictions.csv", index=False)
-        # BUGFIX: `oof` rows are ordered by ids = sorted(real_ids_common), but
-        # real_lbl is in the label CSV's original row order. Comparing the two
-        # directly pairs each prediction with a DIFFERENT study's label, so the
-        # printed AUC was ~random and disagreed with the per-target AUCs below
-        # (which already did the .loc[ids] reindex correctly). Reindex first.
-        mean_auc = auc_mean(
-            real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32),
-            oof)
+        mean_auc = auc_mean(real_lbl[TARGETS].values, oof)
 
     print(f"\nOOF Mean AUC (fine-tuned, on 58 real labels): {mean_auc:.5f}")
     print("\nPer-target AUC:")
@@ -3284,54 +1795,6 @@ def main():
         else:
             print(f"  {t:22s}: (no positives in OOF)")
 
-    # ── Bootstrap CI: with only 58 real studies, a point-estimate AUC can
-    #    look like real improvement/regression when it's actually noise
-    #    from this particular set of 58 -- report the uncertainty band.
-    _real_Y = real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32)
-    _pt, _lo, _hi = bootstrap_auc_ci(_real_Y, oof)
-    print(f"\nOOF Mean AUC 90% bootstrap CI (n=58, 1000 resamples): "
-          f"{_pt:.4f}  [{_lo:.4f}, {_hi:.4f}]")
-    print(f"  interval width = {_hi - _lo:.4f}. Treat any AUC difference smaller "
-          f"than this as noise, not evidence of improvement.")
-    print(f"  fold-safety flags: A0_EXCLUDE_GOLD={EXCLUDE_GOLD_FROM_STAGE_A0} "
-          f"A_EXCLUDE_GOLD={EXCLUDE_GOLD_FROM_STAGE_A} "
-          f"FOLD_SAFE_EPOCHS={FOLD_SAFE_EPOCH_SELECT}")
-    if not (EXCLUDE_GOLD_FROM_STAGE_A0 and EXCLUDE_GOLD_FROM_STAGE_A
-            and FOLD_SAFE_EPOCH_SELECT):
-        print("  [WARNING] One or more fold-safety flags are OFF. Some stage "
-              "trained on the same 58 studies this AUC is measured over, so the "
-              "number above is optimistic by an unknown margin and is not "
-              "comparable to a fold-safe run.")
-
-    # ══ GUARDED PSEUDO-LABELING — refine weak labels using Stage B ═════
-    # Uses the fine-tuned (Stage B) model, not Stage A, since Stage B has
-    # actually seen the 58 real labels. Only touches weak-labeled studies;
-    # the 58 real studies above are never re-scored or overwritten. See
-    # apply_guarded_pseudo_labels() for the exact confidence gates.
-    if RUN_PSEUDO_LABELING:
-        print("\n── PSEUDO-LABELING: refining weak labels with Stage B model ──")
-        pseudo_model_paths = sorted(MODEL_DIR.glob("fold_*.pt"))
-        weak_ids_common = common - real_ids_common
-        weak_lbl_common = lbl[lbl["StudyInstanceUID"].astype(str).isin(weak_ids_common)].copy()
-        weak_emb_common = emb[emb["StudyInstanceUID"].astype(str).isin(weak_ids_common)].copy()
-
-        updated_weak_lbl, pseudo_report = apply_guarded_pseudo_labels(
-            weak_lbl_common, weak_emb_common, pseudo_model_paths, device)
-
-        print("\n  Pseudo-label replacement report (weak studies only, 58 real untouched):")
-        print(pseudo_report.to_string(index=False))
-        total_replaced = int(pseudo_report["n_set_to_1"].sum() + pseudo_report["n_set_to_0"].sum())
-        total_blocked  = int(pseudo_report["n_blocked_by_text"].sum())
-        print(f"  Total labels replaced: {total_replaced}  "
-              f"(blocked by confident contradicting text: {total_blocked})")
-
-        pseudo_out_path = WORK_DIR / "weak_labels_pseudo_refined.csv"
-        updated_weak_lbl.to_csv(pseudo_out_path, index=False)
-        print(f"  Saved refined weak labels to: {pseudo_out_path}")
-        print("  NOTE: this run's Stage A/B models were trained on the ORIGINAL "
-              "weak labels -- refined labels take effect on the NEXT run that "
-              "reads PARSED_LABELS_CSV (or point PARSED_LABELS_CSV at this file).")
-
     # ── Pick blend weight (alpha) between NN and XGBoost using OOF AUC ──
     best_alpha = 1.0
     if xgb_ok and xgb_oof is not None and len(xgb_stage_b_models) > 0:
@@ -3339,72 +1802,23 @@ def main():
             xgb_only_auc = auc_mean(
                 real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values, xgb_oof)
             print(f"\nXGBoost-only OOF AUC: {xgb_only_auc:.5f}")
-            _Y = real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values.astype(np.float32)
-
-            # NESTED alpha selection. Scanning 21 alphas over all 58 studies and
-            # keeping the best is model selection on the evaluation set: at n=58
-            # the winning alpha buys a few points of pure noise, and the reported
-            # "blended AUC" then estimates nothing. Instead, for each fold choose
-            # alpha using ONLY the other folds and score the held-out fold with
-            # it. The nested AUC is an honest estimate of what blending buys.
-            nested_blend = np.zeros_like(oof)
-            per_fold_alpha = {}
-            for f in range(1, n_splits + 1):
-                inner = fold_assign != f
-                outer = fold_assign == f
-                if inner.sum() < 2 or outer.sum() < 1:
-                    per_fold_alpha[f] = 1.0
-                    nested_blend[outer] = oof[outer]
-                    continue
-                best_a, best_v = 1.0, auc_mean(_Y[inner], oof[inner])
-                for a in ALPHA_CANDIDATES:
-                    v = auc_mean(_Y[inner], a * oof[inner] + (1 - a) * xgb_oof[inner])
-                    if not np.isnan(v) and v > best_v:
-                        best_v, best_a = v, a
-                per_fold_alpha[f] = best_a
-                nested_blend[outer] = best_a * oof[outer] + (1 - best_a) * xgb_oof[outer]
-            nested_auc = auc_mean(_Y, nested_blend)
-
-            # In-sample scan, kept only so the two numbers can be compared.
             print("\nBlend search (alpha = NN weight, 1-alpha = XGBoost weight):")
-            insample_best_auc, insample_best_alpha = mean_auc, 1.0
+            best_blend_auc = mean_auc
             for a in ALPHA_CANDIDATES:
-                blend_auc = auc_mean(_Y, a * oof + (1 - a) * xgb_oof)
+                blended = a * oof + (1 - a) * xgb_oof
+                blend_auc = auc_mean(
+                    real_lbl.set_index("StudyInstanceUID").loc[ids, TARGETS].values, blended)
                 marker = ""
-                if not np.isnan(blend_auc) and blend_auc > insample_best_auc:
-                    insample_best_auc, insample_best_alpha = blend_auc, a
+                if not np.isnan(blend_auc) and blend_auc > best_blend_auc:
+                    best_blend_auc = blend_auc
+                    best_alpha     = a
                     marker = "  <- best so far"
                 print(f"  alpha={a:.2f}  blended_auc={blend_auc:.5f}{marker}")
-
-            print(f"\n  per-fold alphas (each chosen without seeing the fold it "
-                  f"scores): {[per_fold_alpha[f] for f in range(1, n_splits + 1)]}")
-            print(f"  NESTED blended OOF AUC : {nested_auc:.5f}   <- the honest number")
-            print(f"  in-sample best alpha   : {insample_best_alpha:.2f} "
-                  f"-> {insample_best_auc:.5f}   (optimistic; alpha was fit on these rows)")
-
-            # Adopt a blend only if it survives nested evaluation. If choosing
-            # alpha per fold does not beat NN-alone out-of-fold, the gain in the
-            # in-sample scan was noise and blending is not justified.
-            if not np.isnan(nested_auc) and nested_auc > mean_auc:
-                best_alpha = float(np.median([per_fold_alpha[f]
-                                              for f in range(1, n_splits + 1)]))
-                print(f"\nChosen alpha={best_alpha:.2f} (median of per-fold choices); "
-                      f"nested {nested_auc:.5f} > NN-only {mean_auc:.5f}")
-            else:
-                best_alpha = 1.0
-                print(f"\nBlending REJECTED: nested {nested_auc:.5f} does not beat "
-                      f"NN-only {mean_auc:.5f}. Submitting NN-only predictions.")
+            print(f"\nChosen alpha={best_alpha:.2f}  "
+                  f"(NN-only={mean_auc:.5f} -> blended={best_blend_auc:.5f})")
         except Exception as e:
             print(f"[WARN] Blend search failed ({e}) — using NN-only predictions.")
             best_alpha = 1.0
-
-    if not RUN_TEST_INFERENCE:
-        print("\n" + "=" * 60)
-        print("TRAINING + OOF COMPLETE (test inference disabled for this run)")
-        print("=" * 60)
-        print(f"OOF AUC    : {mean_auc:.5f}")
-        print(f"Artifacts  : {WORK_DIR}")
-        return
 
     # ══ TEST PIPELINE ═══════════════════════════════════════════
     print("\n── TEST: Scan DICOMs ──")
@@ -3415,10 +1829,10 @@ def main():
     test_slots = assign_slots(test_dcm)
     test_slots["laterality"] = test_slots["StudyInstanceUID"].map(test_lat)
 
-    print("\n── TEST: Embed (TTA on -- rotation-averaged, laterality-safe) ──")
+    print("\n── TEST: Embed ──")
     processor, model_enc, device_enc = load_medsiglip()
     test_emb_idx = embed_slots(test_slots, test_dcm, processor, model_enc,
-                                device_enc, test_lat, EMB_DIR / "test", tta=TEST_TTA)
+                                device_enc, test_lat, EMB_DIR / "test")
     if "model_enc" in dir(): del model_enc
     torch.cuda.empty_cache()
 
