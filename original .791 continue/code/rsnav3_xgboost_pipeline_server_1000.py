@@ -274,6 +274,13 @@ BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", 16))
 SLICE_BAND  = (0.12, 0.88)
 LAT_OFFSET  = 20.0
 PRIOR_STRENGTH = 0.55
+WINDOW_PCT     = (0.5, 99.5)     # FIX #16 (was 1, 99)
+
+# RUN A switches. All default ON; set the env var to 0 to disable one and
+# isolate its effect. None of these require a re-encode.
+TWO_LEVEL_ATT  = os.environ.get("RSNA_TWO_LEVEL", "1") == "1"
+LEARNABLE_PRIOR= os.environ.get("RSNA_LEARN_PRIOR", "1") == "1"
+SLICE_POSENC   = os.environ.get("RSNA_SLICE_POSENC", "1") == "1"
 
 # Index 3 is now AX_T1 (axial T1), not SAG_FLUID_NOFS. Axial T1 shows the
 # patellofemoral joint and tibiofibular articulation well; it is poor for
@@ -742,7 +749,15 @@ def dicom_to_array(path):
     ds  = pydicom.dcmread(str(path))
     arr = ds.pixel_array.astype(np.float32)
     if str(getattr(ds, "PhotometricInterpretation", "")).strip() == "MONOCHROME1":
-        arr = arr.max() - arr
+        # FIX #7: invert against the declared bit depth, not the observed max.
+        # arr.max() makes the inversion image-dependent, so two slices in one
+        # series invert onto different scales and per-series windowing then
+        # normalises an inconsistent mix.
+        try:
+            _bits = int(getattr(ds, "BitsStored", 0) or 0)
+        except Exception:
+            _bits = 0
+        arr = ((2 ** _bits - 1) - arr) if _bits > 0 else (arr.max() - arr)
     slope     = float(getattr(ds, "RescaleSlope",     1.0) or 1.0)
     intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
     return arr * slope + intercept
@@ -762,7 +777,10 @@ def arrays_to_pils(arrays):
     if not arrays:
         return []
     flat = np.concatenate([a.ravel() for a in arrays])
-    lo, hi = np.percentile(flat, [1, 99])
+    # FIX #16: 1/99 clipped 2% of pixels; in a knee with a small bright
+    # effusion the effusion can BE the top 1%. 0.5/99.5 still removes hot
+    # pixels and metal artefact but keeps small bright findings intact.
+    lo, hi = np.percentile(flat, WINDOW_PCT)
     if hi <= lo:
         lo, hi = float(flat.min()), float(flat.max())
     out = []
@@ -798,13 +816,17 @@ def encode_images(images, processor, model, device):
         batch  = images[i:i + BATCH_SIZE]
         inputs = processor(images=batch, return_tensors="pt")
         pixels = inputs["pixel_values"].to(device)
-        if device == "cuda": pixels = pixels.to(dtype=torch.float16)
+        if getattr(device, "type", str(device)) == "cuda":
+            pixels = pixels.to(dtype=torch.float16)
         out = model.get_image_features(pixel_values=pixels)
         if not torch.is_tensor(out):
             if hasattr(out, "pooler_output"):       out = out.pooler_output
             elif hasattr(out, "image_embeds"):      out = out.image_embeds
             elif hasattr(out, "last_hidden_state"): out = out.last_hidden_state.mean(1)
         out = F.normalize(out.float(), dim=-1)
+        if out.shape[-1] != EMBED_DIM:
+            raise RuntimeError(f"encoder returned width {out.shape[-1]}, "
+                               f"EMBED_DIM is {EMBED_DIM}")
         feats.append(out.cpu())
     return torch.cat(feats, dim=0)
 
@@ -838,7 +860,7 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
 
     present = slots_df[slots_df["presence_mask"] == 1].copy()
     index_rows = []
-    done = failed = skipped = n_pooled = 0
+    done = failed = skipped = n_pooled = n_degraded = 0
 
     for _, row in tqdm(present.iterrows(), total=len(present), desc="  Embedding"):
         study  = str(row["StudyInstanceUID"])
@@ -880,7 +902,10 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
                 idx = np.unique(np.round(np.linspace(0, len(band)-1, budget)).astype(int))
                 sp = [band[i] for i in idx]
             paths.extend(sp)
-        if len(srcs) > 1 and len(paths) > len(series_to_files.get(series, [])):
+        # FIX #5: the old test compared the final slice count against the
+        # winner's TOTAL file count, so a 40-file winner capped to 20 never
+        # registered even when pooling really happened.
+        if len(srcs) > 1 and len(paths) > 0:
             n_pooled += 1
         if not paths:
             paths = sort_slices(
@@ -889,10 +914,16 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
             paths = select_band(paths)
 
         # FIX: window per series, not per slice (see arrays_to_pils)
-        arrays = []
+        # FIX #6: per-slice decode failures were swallowed silently, so a slot
+        # where 18 of 20 slices failed still wrote an embedding marked present.
+        arrays, n_bad = [], 0
         for p in paths:
             try: arrays.append(dicom_to_array(p))
-            except Exception: pass
+            except Exception: n_bad += 1
+        if n_bad and (n_bad / max(len(paths), 1)) > 0.20:
+            print(f"\n  [WARN] {study[:16]}/{slot}: {n_bad}/{len(paths)} slices "
+                  f"failed to decode")
+            n_degraded += 1
         images = arrays_to_pils(arrays)
 
         if not images:
@@ -925,7 +956,7 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
                                "presence_mask": 0})
 
     print(f"  Embedded={done} Skipped={skipped} Failed={failed} "
-          f"SlotsPooledFromMultipleSeries={n_pooled}")
+          f"SlotsPooledFromMultipleSeries={n_pooled} Degraded={n_degraded}")
     return pd.DataFrame(index_rows)
 
 
@@ -933,6 +964,39 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
 # STEP 4 — MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 class SlotAttentionModel(nn.Module):
+    """
+    RUN A changes, all in this class. No re-encode needed.
+
+    1. TWO-LEVEL ATTENTION.
+       The old forward ran ONE softmax over every slice of every slot at once
+       (`dim=1` spans the whole concatenated stack). Attention mass therefore
+       tracked SLICE COUNT: a study with 20 sagittal and 5 coronal slices gave
+       sagittal 4x the mass regardless of which view was informative, and a
+       focal ACL tear visible on 3 slices competed against ~100 slices from
+       every other slot at once. Raising MAX_SLICES made that strictly worse,
+       which is the most likely reason ACL fell to 0.762 when slices went
+       12 -> 20.
+
+       Now: pool WITHIN each slot (softmax over that slot's own slices), then
+       pool ACROSS the six slots. Each slot contributes exactly one vector, so
+       slice count no longer buys influence and the anatomical prior operates
+       where it was always meant to -- at the slot level.
+
+    2. LEARNABLE PRIOR.
+       SLOT_PRIOR is hand-written anatomy that was never validated, and the
+       AX_T1 row is a guess about a slot that did not exist last week. It is
+       now an nn.Parameter initialised to those values: the model starts from
+       the anatomy and corrects it from data. Still additive-before-softmax,
+       so a disease can still draw on a non-preferred view -- it is a lean,
+       not a filter.
+
+    3. SLICE POSITION ENCODING.
+       normalise_laterality reverses slice order for sagittal right knees, but
+       a permutation-invariant sum ignores order entirely, so that branch was
+       dead code and ~40% of slots were never laterality-normalised. A learned
+       positional embedding over normalised slice depth makes order matter, so
+       the reversal finally does something.
+    """
     def __init__(self):
         super().__init__()
         self.proj = nn.Sequential(
@@ -941,30 +1005,83 @@ class SlotAttentionModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.15),
         )
-        self.att   = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)
+        self.att = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)          # within-slot
+        self.slot_att = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)     # across-slot
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(PROJ_DIM), nn.Linear(PROJ_DIM, 64),
                           nn.GELU(), nn.Dropout(0.15), nn.Linear(64, 1))
             for _ in TARGETS
         ])
+
         prior = torch.zeros(len(TARGETS), N_SLOT)
         for t, target in enumerate(TARGETS):
-            for s, val in enumerate(SLOT_PRIOR[target]):
-                prior[t, s] = val * PRIOR_STRENGTH
-        self.register_buffer("slot_prior", prior)
+            for sl, val in enumerate(SLOT_PRIOR[target]):
+                prior[t, sl] = val * PRIOR_STRENGTH
+        if LEARNABLE_PRIOR:
+            self.slot_prior = nn.Parameter(prior)
+        else:
+            self.register_buffer("slot_prior", prior)
+
+        # depth -> PROJ_DIM, 32 buckets over the normalised 0..1 slice position
+        self.n_pos = 32
+        self.pos_emb = nn.Embedding(self.n_pos, PROJ_DIM)
+        nn.init.zeros_(self.pos_emb.weight)   # starts as a no-op
+
+    def _add_posenc(self, h, slot_indices):
+        """Depth within each slot, bucketed to 0..n_pos-1."""
+        pos = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+        for sl in torch.unique(slot_indices):
+            m = (slot_indices == sl)
+            k = int(m.sum())
+            if k <= 1:
+                continue
+            frac = torch.linspace(0, 1, k, device=h.device)
+            pos[m] = (frac * (self.n_pos - 1)).round().long()
+        return h + self.pos_emb(pos)
 
     def forward(self, x, mask, slot_indices):
-        h       = self.proj(x)
-        scores  = self.att(h).T
-        scores  = scores + self.slot_prior[:, slot_indices]
-        absent  = (mask[slot_indices] < 0.5)
-        scores  = scores.masked_fill(absent.unsqueeze(0), -1e4)
-        weights = torch.softmax(scores, dim=1)
-        outputs = []
-        for t in range(len(TARGETS)):
-            pooled = (weights[t, :, None] * h).sum(dim=0)
-            outputs.append(self.heads[t](pooled).squeeze())
-        return torch.stack(outputs)
+        h = self.proj(x)
+        if SLICE_POSENC:
+            h = self._add_posenc(h, slot_indices)
+
+        absent = (mask[slot_indices] < 0.5)
+
+        if not TWO_LEVEL_ATT:
+            scores = self.att(h).T + self.slot_prior[:, slot_indices]
+            scores = scores.masked_fill(absent.unsqueeze(0), -1e4)
+            w = torch.softmax(scores, dim=1)
+            return torch.stack([self.heads[t]((w[t, :, None] * h).sum(0)).squeeze()
+                                for t in range(len(TARGETS))])
+
+        T = len(TARGETS)
+        raw = self.att(h).T                       # [T, n_slices]
+        raw = raw.masked_fill(absent.unsqueeze(0), -1e4)
+
+        present = [int(sl) for sl in torch.unique(slot_indices)
+                   if mask[int(sl)] >= 0.5]
+        if not present:                            # nothing usable in this study
+            pooled_all = h.mean(0, keepdim=True).expand(T, -1)
+            return torch.stack([self.heads[t](pooled_all[t]).squeeze()
+                                for t in range(T)])
+
+        # ── level 1: within each slot, over that slot's own slices ──
+        slot_vecs, slot_ids = [], []
+        for sl in present:
+            m = (slot_indices == sl)
+            w = torch.softmax(raw[:, m], dim=1)            # [T, k]
+            slot_vecs.append(torch.einsum("tk,kd->td", w, h[m]))
+            slot_ids.append(sl)
+        V = torch.stack(slot_vecs, dim=1)                  # [T, n_present, PROJ]
+        sid = torch.tensor(slot_ids, device=h.device, dtype=torch.long)
+
+        # ── level 2: across slots, prior applied here ──
+        sc = torch.einsum("tsd,dt->ts", V, self.slot_att.weight.T)
+        sc = sc + self.slot_prior[:, sid]
+        wS = torch.softmax(sc, dim=1)                      # [T, n_present]
+        pooled = torch.einsum("ts,tsd->td", wS, V)         # [T, PROJ]
+
+        return torch.stack([self.heads[t](pooled[t]).squeeze()
+                            for t in range(T)])
 
 
 def load_embedding(path):
@@ -1375,6 +1492,9 @@ def main():
 
     print("=" * 60)
     print("RSNA KNEE ABNORMALITY DETECTION")
+    print(f"RUN A  two_level_att={TWO_LEVEL_ATT}  learnable_prior={LEARNABLE_PRIOR}  "
+          f"slice_posenc={SLICE_POSENC}")
+    print(f"       MAX_SLICES={MAX_SLICES}  BAND={SLICE_BAND}  WINDOW={WINDOW_PCT}")
     print(f"Device  : {device}")
     print(f"Kaggle  : {IS_KAGGLE}")
     print("=" * 60)
