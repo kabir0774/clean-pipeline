@@ -1238,7 +1238,7 @@ class StudyDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
+                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1412,7 +1412,7 @@ class InferDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
+                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1509,7 +1509,7 @@ def study_pooled_embedding(study, emb_df):
     """
     rows = emb_df[emb_df["StudyInstanceUID"] == study]
     slot_to_file = {r["slot_name"]: r["embedding_file"]
-                    for _, r in rows.iterrows() if r["presence_mask"] == 1}
+                    for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
     tensors = []
     mask = np.zeros(N_SLOT, dtype=np.float32)
     for s_idx, slot_name in enumerate(SLOT_NAMES):
