@@ -29,6 +29,31 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoModel
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
+
+
+def report_groups(study_ids, data_root):
+    """
+    Group key for GroupKFold. Grouping by study UID leaks: 49 reports in
+    train.csv are shared verbatim by 183 studies (one report by 37 of them), and
+    a shared report yields ONE derived target vector for all of them. Split by
+    study and those identical-target rows land on both sides of the fold, so OOF
+    reads optimistically. Grouping by report hash keeps them together.
+    """
+    import hashlib
+    p = Path(data_root) / "train.csv"
+    if not p.exists():
+        return list(study_ids)
+    t = pd.read_csv(p, dtype={"StudyInstanceUID": str})
+    if "Report" not in t.columns:
+        return list(study_ids)
+    h = {r.StudyInstanceUID: hashlib.md5(str(r.Report or "").strip().encode()).hexdigest()
+         for r in t.itertuples(index=False)}
+    g = [h.get(str(s), str(s)) for s in study_ids]
+    n_st, n_gr = len(set(map(str, study_ids))), len(set(g))
+    if n_gr < n_st:
+        print(f"  fold groups: {n_gr} report-groups from {n_st} studies "
+              f"({n_st - n_gr} studies share a report with another)")
+    return g
 from sklearn.decomposition import PCA
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -264,8 +289,22 @@ SLOT_NAMES = [
     "SAG_T1",
 ]
 N_SLOT    = len(SLOT_NAMES)
-EMBED_DIM = 1152
+EMBED_DIM_BASE = 1152
 PROJ_DIM  = 256
+
+# Patch-level pooling. get_image_features returns ONE pooled vector per image,
+# which averages every patch in the field. A meniscal tear occupies a small part
+# of that field, so a plain mean over ~256 patches dilutes it by roughly two
+# orders of magnitude -- the same dilution problem as slice pooling, one level
+# down. "cls_mean_focal" concatenates the CLS token, the patch mean, and the
+# mean of the top eighth of each channel's responses across patches, so a strong
+# localised response survives instead of being averaged into the background.
+#   "pooled"          -> 1x EMBED_DIM  (previous behaviour, get_image_features)
+#   "cls_mean"        -> 2x
+#   "cls_mean_focal"  -> 3x            (default)
+PATCH_POOL = os.environ.get("RSNA_PATCH_POOL", "cls_mean_focal").lower()
+POOL_PARTS = {"pooled": 1, "cls_mean": 2, "cls_mean_focal": 3}[PATCH_POOL]
+EMBED_DIM  = EMBED_DIM_BASE * POOL_PARTS
 # Raised to process more of each series. 12 slices from the middle 60%
 # used only ~31% of the DICOMs on disk. 20 slices from the middle 76%
 # roughly doubles coverage. Encoding time scales linearly with this.
@@ -281,6 +320,35 @@ WINDOW_PCT     = (0.5, 99.5)     # FIX #16 (was 1, 99)
 TWO_LEVEL_ATT  = os.environ.get("RSNA_TWO_LEVEL", "1") == "1"
 LEARNABLE_PRIOR= os.environ.get("RSNA_LEARN_PRIOR", "1") == "1"
 SLICE_POSENC   = os.environ.get("RSNA_SLICE_POSENC", "1") == "1"
+
+# Within-slot pooling. The original Stanford MRNet MAX-pools across slices
+# rather than using softmax attention, and that is not incidental: softmax
+# weights must sum to 1, so a finding visible on 3 of 20 slices is diluted by
+# the 17 showing nothing. Max keeps the strongest evidence. Your worst classes
+# are the focal ones (ACL, both menisci); your best is Effusion, which is
+# diffuse and bright on every slice -- exactly the pattern dilution predicts.
+#   "max" -> pure max over slices
+#   "att" -> softmax attention (Run A behaviour)
+#   "mix" -> 0.5*max + 0.5*attention  (default)
+SLOT_POOL = os.environ.get("RSNA_SLOT_POOL", "mix").lower()
+
+# Sliding-window TTA. The embedding cache already holds every slice, so looking
+# at more of them at inference costs forward passes and no extra decoding. The
+# model is read over each consecutive window of TTA_GROUP slices per slot and
+# the results averaged. Logit-space averaging is a geometric mean of odds,
+# probability-space an arithmetic mean of risk; they order studies differently,
+# and macro-AUC reads only order, so this is a real choice rather than a detail.
+TTA_WINDOWS = int(os.environ.get("RSNA_TTA_WINDOWS", 0))   # 0 = off
+TTA_GROUP   = int(os.environ.get("RSNA_TTA_GROUP", 12))
+TTA_POOL    = os.environ.get("RSNA_TTA_POOL", "logit").lower()
+
+# Fingerprinting. Weights loaded through the wrong preprocessing produce
+# predictions, not errors: the submission is well formed, the log says nothing,
+# and no output of the run reveals the difference. A checkpoint therefore
+# carries the answer it gave to a seeded synthetic input, recomputed before use.
+# GPU numeric noise moves that by ~1e-5; any real preprocessing difference moves
+# it by order one, so the tolerance sits between them.
+FINGERPRINT_TOL = 2e-3
 
 # Index 3 is now AX_T1 (axial T1), not SAG_FLUID_NOFS. Axial T1 shows the
 # patellofemoral joint and tibiofibular articulation well; it is poor for
@@ -818,12 +886,27 @@ def encode_images(images, processor, model, device):
         pixels = inputs["pixel_values"].to(device)
         if getattr(device, "type", str(device)) == "cuda":
             pixels = pixels.to(dtype=torch.float16)
-        out = model.get_image_features(pixel_values=pixels)
-        if not torch.is_tensor(out):
-            if hasattr(out, "pooler_output"):       out = out.pooler_output
-            elif hasattr(out, "image_embeds"):      out = out.image_embeds
-            elif hasattr(out, "last_hidden_state"): out = out.last_hidden_state.mean(1)
-        out = F.normalize(out.float(), dim=-1)
+        if PATCH_POOL == "pooled":
+            out = model.get_image_features(pixel_values=pixels)
+            if not torch.is_tensor(out):
+                if hasattr(out, "pooler_output"):       out = out.pooler_output
+                elif hasattr(out, "image_embeds"):      out = out.image_embeds
+                elif hasattr(out, "last_hidden_state"): out = out.last_hidden_state.mean(1)
+            out = F.normalize(out.float(), dim=-1)
+        else:
+            # Reach into the vision tower for the patch grid. get_image_features
+            # discards it, and the patch grid is where a focal finding lives.
+            vt = getattr(model, "vision_model", model)
+            hs = vt(pixel_values=pixels).last_hidden_state      # [B, 1+P, D] or [B, P, D]
+            if hs.shape[1] % 2 == 1:                            # CLS present
+                cls, patch = hs[:, 0], hs[:, 1:]
+            else:                                               # no CLS token
+                cls, patch = hs.mean(1), hs
+            parts = [cls, patch.mean(1)]
+            if PATCH_POOL == "cls_mean_focal":
+                k = max(1, patch.shape[1] // 8)
+                parts.append(patch.topk(k, dim=1).values.mean(1))
+            out = torch.cat([F.normalize(p.float(), dim=-1) for p in parts], dim=-1)
         if out.shape[-1] != EMBED_DIM:
             raise RuntimeError(f"encoder returned width {out.shape[-1]}, "
                                f"EMBED_DIM is {EMBED_DIM}")
@@ -963,6 +1046,42 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — MODEL
 # ══════════════════════════════════════════════════════════════════════════════
+def fingerprint(model, dev=None):
+    """Model output on a fixed synthetic bag — a portable identity for the map.
+
+    Seeded rather than read, so it is identical on any machine, and pushed
+    through the whole forward path (projection, positional encoding, both
+    attention levels, the heads). Any of those differing moves the value.
+    """
+    dev = dev or next(model.parameters()).device
+    g = torch.Generator().manual_seed(1234)
+    x = torch.randn(2 * N_SLOT, EMBED_DIM, generator=g).to(dev)
+    idx = torch.arange(N_SLOT, device=dev).repeat_interleave(2)
+    mask = torch.ones(N_SLOT, device=dev)
+    mask[-1] = 0.0                      # exercise the masked branch of the softmax
+    was = model.training
+    model.eval()
+    with torch.no_grad():
+        out = model(x, mask, idx).float().cpu().numpy()
+    if was:
+        model.train()
+    return out
+
+
+def check_fingerprint(model, expected, tag=""):
+    if expected is None:
+        return
+    got = fingerprint(model)
+    d = float(np.abs(np.asarray(got) - np.asarray(expected)).max())
+    if d > FINGERPRINT_TOL:
+        raise RuntimeError(
+            f"fingerprint mismatch{(' [' + tag + ']') if tag else ''}: max diff "
+            f"{d:.2e} > {FINGERPRINT_TOL:.0e}. The weights load but do not compute "
+            f"what they computed when fitted — check PATCH_POOL, MAX_SLICES, "
+            f"SLICE_BAND, WINDOW_PCT, SLOT_POOL and the Run A switches.")
+    print(f"  fingerprint ok{(' [' + tag + ']') if tag else ''} (max diff {d:.2e})")
+
+
 class SlotAttentionModel(nn.Module):
     """
     RUN A changes, all in this class. No re-encode needed.
@@ -1068,8 +1187,15 @@ class SlotAttentionModel(nn.Module):
         slot_vecs, slot_ids = [], []
         for sl in present:
             m = (slot_indices == sl)
-            w = torch.softmax(raw[:, m], dim=1)            # [T, k]
-            slot_vecs.append(torch.einsum("tk,kd->td", w, h[m]))
+            hm = h[m]                                      # [k, PROJ]
+            if SLOT_POOL == "max":
+                v = hm.max(0).values.unsqueeze(0).expand(T, -1)
+            else:
+                w = torch.softmax(raw[:, m], dim=1)        # [T, k]
+                v = torch.einsum("tk,kd->td", w, hm)
+                if SLOT_POOL == "mix":
+                    v = 0.5 * v + 0.5 * hm.max(0).values.unsqueeze(0)
+            slot_vecs.append(v)
             slot_ids.append(sl)
         V = torch.stack(slot_vecs, dim=1)                  # [T, n_present, PROJ]
         sid = torch.tensor(slot_ids, device=h.device, dtype=torch.long)
@@ -1495,6 +1621,10 @@ def main():
     print(f"RUN A  two_level_att={TWO_LEVEL_ATT}  learnable_prior={LEARNABLE_PRIOR}  "
           f"slice_posenc={SLICE_POSENC}")
     print(f"       MAX_SLICES={MAX_SLICES}  BAND={SLICE_BAND}  WINDOW={WINDOW_PCT}")
+    print(f"       slot_pool={SLOT_POOL}  patch_pool={PATCH_POOL} "
+          f"(embed_dim={EMBED_DIM})")
+    if TTA_WINDOWS:
+        print(f"       tta_windows={TTA_WINDOWS} group={TTA_GROUP} pool={TTA_POOL}")
     print(f"Device  : {device}")
     print(f"Kaggle  : {IS_KAGGLE}")
     print("=" * 60)
@@ -1671,7 +1801,7 @@ def main():
         best_stage_a_model = None
 
         for sa_fold, (sa_tri, sa_vi) in enumerate(
-            stage_a_gkf.split(stage_a_table, groups=stage_a_table.study), 1
+            stage_a_gkf.split(stage_a_table, groups=report_groups(stage_a_table.study, DATA_ROOT)), 1
         ):
             sa_tr_ids = pretrain_ids[sa_tri]
             sa_va_ids = pretrain_ids[sa_vi]
@@ -1751,7 +1881,7 @@ def main():
                 xgb_sa_gkf = GroupKFold(n_splits=5)
                 xgb_sa_table = pd.DataFrame({"study": pretrain_ids})
                 for xfold, (xtri, xvi) in enumerate(
-                    xgb_sa_gkf.split(xgb_sa_table, groups=xgb_sa_table.study), 1
+                    xgb_sa_gkf.split(xgb_sa_table, groups=report_groups(xgb_sa_table.study, DATA_ROOT)), 1
                 ):
                     fold_models = train_xgb_per_target(X_pool[xtri], Y_pool[xtri], W_pool[xtri])
                     stage_a_xgb_oof[xvi] = predict_xgb(fold_models, X_pool[xvi])
@@ -1842,7 +1972,7 @@ def main():
 
     else:
         # ── normal training loop ──────────────────────────────────────────────
-        for fold, (tri, vi) in enumerate(gkf.split(table, groups=table.study), 1):
+        for fold, (tri, vi) in enumerate(gkf.split(table, groups=report_groups(table.study, DATA_ROOT)), 1):
             fold_ckpt_path = MODEL_DIR / f"fold_{fold}.pt"
             tr_fold_ids = ids[tri]; va_fold_ids = ids[vi]
             tr_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(tr_fold_ids)],
@@ -1873,9 +2003,20 @@ def main():
 
             fold_auc = auc_mean(np.vstack(Y), np.vstack(P))
             print(f"[FOLD {fold}] AUC={fold_auc:.5f}")
+            # The reading travels with the member: a checkpoint that loads under
+            # different preprocessing runs cleanly and returns a submission
+            # computed from the wrong pixels, so the config and a fingerprint of
+            # the fitted map are stored alongside the weights.
             torch.save({"model_state_dict": fold_model.state_dict(),
                         "targets": TARGETS, "slot_names": SLOT_NAMES,
-                        "embed_dim": EMBED_DIM, "proj_dim": PROJ_DIM},
+                        "embed_dim": EMBED_DIM, "proj_dim": PROJ_DIM,
+                        "fingerprint": fingerprint(fold_model),
+                        "config": {"PATCH_POOL": PATCH_POOL, "MAX_SLICES": MAX_SLICES,
+                                   "SLICE_BAND": SLICE_BAND, "WINDOW_PCT": WINDOW_PCT,
+                                   "SLOT_POOL": SLOT_POOL,
+                                   "TWO_LEVEL_ATT": TWO_LEVEL_ATT,
+                                   "LEARNABLE_PRIOR": LEARNABLE_PRIOR,
+                                   "SLICE_POSENC": SLICE_POSENC}},
                        MODEL_DIR / f"fold_{fold}.pt")
 
             if xgb_ok and xgb_oof is not None:
