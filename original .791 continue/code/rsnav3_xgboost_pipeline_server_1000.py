@@ -271,7 +271,7 @@ else:
     PARSED_LABELS_CSV = Path(r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv")
 
 N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_STUDIES", 4407))  # FIX: was 4340; dataset has 4,407
-SAMPLE_SEED     = 42
+SAMPLE_SEED     = int(os.environ.get("RSNA_SEED", 42))
 
 # ── constants ─────────────────────────────────────────────────────────────────
 TARGETS = [
@@ -393,7 +393,16 @@ MAX_SLICE_THICK   = 8.0    # mm; knee MRI is typically 3-4mm
 MIN_INPLANE_DIM   = 160    # px; scouts are low-res
 
 
-def seed_everything(s=42):
+# Run-to-run variance has never been measured here, so every comparison so far
+# has been one number against one number with no idea how much a number moves on
+# its own. Same config trained twice gives two different models: weights start
+# random, dropout drops different units, and cuDNN sums in a nondeterministic
+# order. Run one config at several seeds and the spread IS the noise floor.
+RUN_SEED = int(os.environ.get("RSNA_SEED", 42))
+
+
+def seed_everything(s=None):
+    s = RUN_SEED if s is None else s
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
@@ -1610,7 +1619,7 @@ def predict_xgb(models, X):
 
 
 def main():
-    seed_everything(42)
+    seed_everything()          # honours RSNA_SEED
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # local flag (not the module-level XGB_AVAILABLE) so any failure inside
     # main() can disable the stacking layer for this run only, cleanly
