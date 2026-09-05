@@ -310,7 +310,11 @@ EMBED_DIM  = EMBED_DIM_BASE * POOL_PARTS
 # roughly doubles coverage. Encoding time scales linearly with this.
 MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 20))
 BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", 16))
-SLICE_BAND  = (0.12, 0.88)
+# 6-94%, not 12-88%. The collateral ligaments and the lateral meniscus sit in
+# the peripheral slices a tighter band discards, and those are two of the
+# weakest classes in this pipeline.
+SLICE_BAND  = (float(os.environ.get("RSNA_BAND_LO", 0.06)),
+               float(os.environ.get("RSNA_BAND_HI", 0.94)))
 LAT_OFFSET  = 20.0
 PRIOR_STRENGTH = 0.55
 WINDOW_PCT     = (0.5, 99.5)     # FIX #16 (was 1, 99)
@@ -331,6 +335,22 @@ SLICE_POSENC   = os.environ.get("RSNA_SLICE_POSENC", "1") == "1"
 #   "att" -> softmax attention (Run A behaviour)
 #   "mix" -> 0.5*max + 0.5*attention  (default)
 SLOT_POOL = os.environ.get("RSNA_SLOT_POOL", "mix").lower()
+
+# Physical-millimetre cropping. Until now every slice was handed to the
+# processor whole and resized to 384, so a wide field-of-view scanner produced a
+# small knee in a large frame and a tight one produced a large knee -- the same
+# anatomy arriving at different scales, leaving the encoder to absorb a
+# scale-invariance it should never have needed. Cropping a fixed CROP_MM box
+# around the image centre using PixelSpacing makes the knee occupy the same
+# fraction of the frame whatever the scanner did.
+CROP_MM = float(os.environ.get("RSNA_CROP_MM", 140.0))   # 0 disables
+
+# Three neighbouring slices in the three colour channels. SigLIP wants three
+# channels and a grey slice was being copied into all three, so two thirds of
+# the input carried no information. Filling them with the slices above and
+# below gives the encoder local depth context at no extra cost -- most of what
+# a 3D network buys, for the price of a 2D one.
+RGB_MODE = os.environ.get("RSNA_RGB_MODE", "neighbours").lower()   # or "gray"
 
 # Sliding-window TTA. The embedding cache already holds every slice, so looking
 # at more of them at inference costs forward passes and no extra decoding. The
@@ -812,8 +832,12 @@ def normalise_laterality(imgs, plane, lat):
     return imgs[::-1]
 
 
-def dicom_to_array(path):
-    """Raw rescaled float array for one slice, polarity corrected."""
+def dicom_to_array(path, want_spacing=False):
+    """Raw rescaled float array for one slice, polarity corrected.
+
+    want_spacing also returns the in-plane PixelSpacing in mm, which the
+    millimetre crop needs and which is otherwise thrown away here.
+    """
     ds  = pydicom.dcmread(str(path))
     arr = ds.pixel_array.astype(np.float32)
     if str(getattr(ds, "PhotometricInterpretation", "")).strip() == "MONOCHROME1":
@@ -828,7 +852,37 @@ def dicom_to_array(path):
         arr = ((2 ** _bits - 1) - arr) if _bits > 0 else (arr.max() - arr)
     slope     = float(getattr(ds, "RescaleSlope",     1.0) or 1.0)
     intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
-    return arr * slope + intercept
+    out = arr * slope + intercept
+    if not want_spacing:
+        return out
+    ps = None
+    try:
+        v = getattr(ds, "PixelSpacing", None)
+        if v is not None and len(v) >= 2:
+            ps = (float(v[0]) + float(v[1])) / 2.0     # row/col spacing, mm
+    except Exception:
+        ps = None
+    return out, ps
+
+
+def mm_crop(a, spacing, crop_mm=None):
+    """Centre-crop a fixed physical box, then leave resizing to the processor.
+
+    spacing is mm per pixel, so crop_mm / spacing is the box in pixels. A slice
+    whose field of view is already smaller than the box is returned untouched
+    rather than padded -- padding would invent tissue at the edge of the frame,
+    and the edge of this crop is where the popliteal fossa sits.
+    """
+    crop_mm = CROP_MM if crop_mm is None else crop_mm
+    if not crop_mm or spacing is None or not np.isfinite(spacing) or spacing <= 0:
+        return a
+    px = int(round(crop_mm / spacing))
+    h, w = a.shape[:2]
+    if px >= min(h, w) or px < 32:
+        return a
+    cy, cx = h // 2, w // 2
+    y0, x0 = max(0, cy - px // 2), max(0, cx - px // 2)
+    return a[y0:y0 + px, x0:x0 + px]
 
 
 def arrays_to_pils(arrays):
@@ -851,13 +905,27 @@ def arrays_to_pils(arrays):
     lo, hi = np.percentile(flat, WINDOW_PCT)
     if hi <= lo:
         lo, hi = float(flat.min()), float(flat.max())
-    out = []
+    u8s = []
     for a in arrays:
         if hi <= lo:
-            u8 = np.zeros(a.shape, dtype=np.uint8)
+            u8s.append(np.zeros(a.shape, dtype=np.uint8))
         else:
-            u8 = (np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-        out.append(Image.fromarray(u8).convert("RGB"))
+            u8s.append((np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8))
+
+    if RGB_MODE != "neighbours" or len(u8s) < 2:
+        return [Image.fromarray(u) .convert("RGB") for u in u8s]
+
+    # Channels are slice n-1, n, n+1. Neighbours are only stacked when they are
+    # the same shape -- a series whose slices differ in size would otherwise
+    # silently mis-register the channels against each other, which is worse
+    # than having no depth context at all.
+    out, N = [], len(u8s)
+    for i, mid in enumerate(u8s):
+        prv, nxt = u8s[max(0, i - 1)], u8s[min(N - 1, i + 1)]
+        if prv.shape != mid.shape or nxt.shape != mid.shape:
+            out.append(Image.fromarray(mid).convert("RGB"))
+        else:
+            out.append(Image.fromarray(np.stack([prv, mid, nxt], axis=-1), mode="RGB"))
     return out
 
 
@@ -1001,8 +1069,11 @@ def embed_slots(slots_df, dicom_df, processor, model, device,
         # where 18 of 20 slices failed still wrote an embedding marked present.
         arrays, n_bad = [], 0
         for p in paths:
-            try: arrays.append(dicom_to_array(p))
-            except Exception: n_bad += 1
+            try:
+                a, ps = dicom_to_array(p, want_spacing=True)
+                arrays.append(mm_crop(a, ps))
+            except Exception:
+                n_bad += 1
         if n_bad and (n_bad / max(len(paths), 1)) > 0.20:
             print(f"\n  [WARN] {study[:16]}/{slot}: {n_bad}/{len(paths)} slices "
                   f"failed to decode")
@@ -1147,15 +1218,31 @@ class SlotAttentionModel(nn.Module):
         nn.init.zeros_(self.pos_emb.weight)   # starts as a no-op
 
     def _add_posenc(self, h, slot_indices):
-        """Depth within each slot, bucketed to 0..n_pos-1."""
-        pos = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
-        for sl in torch.unique(slot_indices):
-            m = (slot_indices == sl)
-            k = int(m.sum())
-            if k <= 1:
-                continue
-            frac = torch.linspace(0, 1, k, device=h.device)
-            pos[m] = (frac * (self.n_pos - 1)).round().long()
+        """Depth within each slot, bucketed to 0..n_pos-1.
+
+        Vectorised. The original looped over slots and called int(m.sum()) per
+        slot, which pulls a scalar off the GPU and stalls the pipeline on every
+        sample -- it is also what broke torch.compile, and it is why Stage A
+        folds went from ~25 minutes to ~72. Rank-within-slot is computed here
+        with a scatter and a cumulative sum, entirely on device.
+        """
+        # Raw counts, NOT clamped: an absent slot must contribute zero rows to
+        # the offsets, otherwise every slot after it is shifted and the depth
+        # ranks come out wrong for exactly the studies that are missing a slot.
+        counts = torch.bincount(slot_indices, minlength=N_SLOT)
+        # slot_indices is sorted ascending by construction (rows are appended
+        # slot by slot), so a row's rank within its slot is its absolute
+        # position minus where that slot starts.
+        order = torch.arange(h.shape[0], device=h.device)
+        starts = torch.cumsum(
+            torch.cat([torch.zeros(1, dtype=counts.dtype, device=h.device),
+                       counts[:-1]]), 0)
+        rank = order - starts[slot_indices]
+        denom = (counts[slot_indices] - 1).clamp(min=1).to(h.dtype)
+        frac = rank.to(h.dtype) / denom
+        frac = torch.where(counts[slot_indices] > 1, frac,
+                           torch.zeros_like(frac))
+        pos = (frac * (self.n_pos - 1)).round().long().clamp(0, self.n_pos - 1)
         return h + self.pos_emb(pos)
 
     def forward(self, x, mask, slot_indices):
@@ -1184,21 +1271,28 @@ class SlotAttentionModel(nn.Module):
                                 for t in range(T)])
 
         # ── level 1: within each slot, over that slot's own slices ──
-        slot_vecs, slot_ids = [], []
-        for sl in present:
-            m = (slot_indices == sl)
-            hm = h[m]                                      # [k, PROJ]
-            if SLOT_POOL == "max":
-                v = hm.max(0).values.unsqueeze(0).expand(T, -1)
-            else:
-                w = torch.softmax(raw[:, m], dim=1)        # [T, k]
-                v = torch.einsum("tk,kd->td", w, hm)
-                if SLOT_POOL == "mix":
-                    v = 0.5 * v + 0.5 * hm.max(0).values.unsqueeze(0)
-            slot_vecs.append(v)
-            slot_ids.append(sl)
-        V = torch.stack(slot_vecs, dim=1)                  # [T, n_present, PROJ]
-        sid = torch.tensor(slot_ids, device=h.device, dtype=torch.long)
+        # Vectorised over slots. The loop below used to run once per slot per
+        # sample with a host sync inside it; this does all six at once with a
+        # masked softmax and two scatter-adds, and never leaves the device.
+        sid = torch.tensor(present, device=h.device, dtype=torch.long)
+        S = sid.shape[0]
+        # [S, n] membership, so every reduction below is one op over all slots
+        memb = (slot_indices.unsqueeze(0) == sid.unsqueeze(1))       # [S, n]
+
+        # softmax over each slot's own slices: mask the rest to -inf per slot
+        sc = raw.unsqueeze(1).expand(T, S, -1).masked_fill(
+            ~memb.unsqueeze(0), float("-inf"))                       # [T, S, n]
+        w = torch.softmax(sc, dim=2)
+        w = torch.nan_to_num(w, nan=0.0)          # a slot with no rows -> zeros
+        att = torch.einsum("tsn,nd->tsd", w, h)                      # [T, S, D]
+
+        if SLOT_POOL in ("max", "mix"):
+            big = h.unsqueeze(0).masked_fill(~memb.unsqueeze(-1), -1e4)
+            mx = big.max(dim=1).values                               # [S, D]
+            mx = mx.unsqueeze(0).expand(T, -1, -1)
+            V = mx if SLOT_POOL == "max" else 0.5 * att + 0.5 * mx
+        else:
+            V = att
 
         # ── level 2: across slots, prior applied here ──
         sc = torch.einsum("tsd,dt->ts", V, self.slot_att.weight.T)
@@ -1238,7 +1332,7 @@ class StudyDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1412,7 +1506,7 @@ class InferDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1509,7 +1603,7 @@ def study_pooled_embedding(study, emb_df):
     """
     rows = emb_df[emb_df["StudyInstanceUID"] == study]
     slot_to_file = {r["slot_name"]: r["embedding_file"]
-                    for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                    for _, r in rows.iterrows() if r["presence_mask"] == 1}
     tensors = []
     mask = np.zeros(N_SLOT, dtype=np.float32)
     for s_idx, slot_name in enumerate(SLOT_NAMES):
@@ -1623,6 +1717,7 @@ def main():
     print(f"       MAX_SLICES={MAX_SLICES}  BAND={SLICE_BAND}  WINDOW={WINDOW_PCT}")
     print(f"       slot_pool={SLOT_POOL}  patch_pool={PATCH_POOL} "
           f"(embed_dim={EMBED_DIM})")
+    print(f"       crop_mm={CROP_MM}  rgb_mode={RGB_MODE}")
     if TTA_WINDOWS:
         print(f"       tta_windows={TTA_WINDOWS} group={TTA_GROUP} pool={TTA_POOL}")
     print(f"Device  : {device}")
@@ -1720,7 +1815,27 @@ def main():
             for _p in list(MODEL_DIR.glob("*.pt")) + list(MODEL_DIR.glob("*.pkl")):
                 _p.unlink(); print(f"    removed {_p.name}")
 
+    # Anything that changes the PIXELS fed to MedSigLIP must invalidate the
+    # embedding cache. Reuse was gated only on the two index files existing, so
+    # changing MAX_SLICES, the band, the window, the millimetre crop or the
+    # channel layout would silently reuse embeddings built under the old
+    # settings: the run completes, the numbers move, and nothing says why.
+    _sig_path = WORK_DIR / "embedding_signature.txt"
+    _sig = "|".join(str(v) for v in [
+        "medsiglip", EMBED_DIM_BASE, PATCH_POOL, MAX_SLICES, SLICE_BAND,
+        WINDOW_PCT, CROP_MM, RGB_MODE, tuple(SLOT_NAMES),
+    ])
     if _cached_dcm_idx.exists() and _cached_emb_idx.exists():
+        _old = _sig_path.read_text().strip() if _sig_path.exists() else None
+        if _old is not None and _old != _sig:
+            raise RuntimeError(
+                "cached embeddings were built with different preprocessing.\n"
+                f"  cached : {_old}\n"
+                f"  current: {_sig}\n"
+                "Re-run with RSNA_FORCE_RESCAN=1, or restore the old settings.")
+        if _old is None:
+            print("  [WARN] cache has no signature (predates this check) — "
+                  "cannot verify it matches the current preprocessing")
         print("  Found existing DICOM + embedding index — skipping scan/slot/embed steps")
         train_dcm     = pd.read_csv(_cached_dcm_idx, dtype=str)
         train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
@@ -1756,6 +1871,7 @@ def main():
         train_emb_idx = embed_slots(train_slots, train_dcm, processor, model_enc,
                                      device_enc, train_lat, EMB_DIR / "train")
         train_emb_idx.to_csv(WORK_DIR / "train_embedding_index.csv", index=False)
+        _sig_path.write_text(_sig)      # so the next run can verify the cache
     if "model_enc" in dir(): del model_enc
     torch.cuda.empty_cache()
 
