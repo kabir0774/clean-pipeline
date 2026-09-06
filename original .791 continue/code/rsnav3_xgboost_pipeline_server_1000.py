@@ -271,7 +271,7 @@ else:
     PARSED_LABELS_CSV = Path(r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv")
 
 N_TOTAL_STUDIES = int(os.environ.get("RSNA_N_STUDIES", 4407))  # FIX: was 4340; dataset has 4,407
-SAMPLE_SEED     = int(os.environ.get("RSNA_SEED", 42))
+SAMPLE_SEED     = 42
 
 # ── constants ─────────────────────────────────────────────────────────────────
 TARGETS = [
@@ -413,16 +413,7 @@ MAX_SLICE_THICK   = 8.0    # mm; knee MRI is typically 3-4mm
 MIN_INPLANE_DIM   = 160    # px; scouts are low-res
 
 
-# Run-to-run variance has never been measured here, so every comparison so far
-# has been one number against one number with no idea how much a number moves on
-# its own. Same config trained twice gives two different models: weights start
-# random, dropout drops different units, and cuDNN sums in a nondeterministic
-# order. Run one config at several seeds and the spread IS the noise floor.
-RUN_SEED = int(os.environ.get("RSNA_SEED", 42))
-
-
-def seed_everything(s=None):
-    s = RUN_SEED if s is None else s
+def seed_everything(s=42):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
@@ -1341,7 +1332,7 @@ class StudyDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1415,7 +1406,22 @@ def train_fold(train_ds, val_ds, device, epochs):
                          for s in train_ds.ids])
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+    # Per-target weight, not just per-class positive weight. pos_weight already
+    # corrects for how RARE a finding is; this corrects for how RELIABLE the
+    # label is, which is a different axis: a finding the reports rarely discuss
+    # produces a mostly-silent training signal, and weighting it equally with a
+    # finding they always describe tells the model to trust the silence.
+    _cw = torch.tensor(
+        [float(CLASS_W.get(t, 1.0)) for t in TARGETS],
+        device=device, dtype=torch.float32) if "CLASS_W" in globals() else None
+    _bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
+                                reduction="none")
+
+    def loss_fn(logits, target, _cw=_cw, _bce=_bce):
+        l = _bce(logits, target)
+        if _cw is not None:
+            l = l * _cw
+        return l.mean()
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
@@ -1464,7 +1470,22 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
                          for s in train_ds.ids])
     pos     = yy.sum(axis=0)
     pw      = np.maximum((len(yy) - pos) / np.maximum(pos, 1), 1.0).astype(np.float32)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+    # Per-target weight, not just per-class positive weight. pos_weight already
+    # corrects for how RARE a finding is; this corrects for how RELIABLE the
+    # label is, which is a different axis: a finding the reports rarely discuss
+    # produces a mostly-silent training signal, and weighting it equally with a
+    # finding they always describe tells the model to trust the silence.
+    _cw = torch.tensor(
+        [float(CLASS_W.get(t, 1.0)) for t in TARGETS],
+        device=device, dtype=torch.float32) if "CLASS_W" in globals() else None
+    _bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device),
+                                reduction="none")
+
+    def loss_fn(logits, target, _cw=_cw, _bce=_bce):
+        l = _bce(logits, target)
+        if _cw is not None:
+            l = l * _cw
+        return l.mean()
     best_state, best_auc = None, -np.inf
 
     for epoch in range(epochs):
@@ -1515,7 +1536,7 @@ class InferDataset:
         study = self.ids[i]
         rows  = self.emb_df[self.emb_df["StudyInstanceUID"] == study]
         slot_to_file = {r["slot_name"]: r["embedding_file"]
-                        for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                        for _, r in rows.iterrows() if r["presence_mask"] == 1}
         tensors, slot_indices, mask = [], [], torch.zeros(N_SLOT)
         for s_idx, slot_name in enumerate(SLOT_NAMES):
             if slot_name in slot_to_file:
@@ -1612,7 +1633,7 @@ def study_pooled_embedding(study, emb_df):
     """
     rows = emb_df[emb_df["StudyInstanceUID"] == study]
     slot_to_file = {r["slot_name"]: r["embedding_file"]
-                    for _, r in rows.iterrows() if str(r["presence_mask"]) in ("1", "1.0", "True", "true")}
+                    for _, r in rows.iterrows() if r["presence_mask"] == 1}
     tensors = []
     mask = np.zeros(N_SLOT, dtype=np.float32)
     for s_idx, slot_name in enumerate(SLOT_NAMES):
@@ -1653,7 +1674,109 @@ def make_features(raw_embed, mask, pca, extra=None):
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def soft_label_weight(y_soft, is_real, conf=None):
+# Per-class label reliability. This is measured from the VERDICT DISTRIBUTION
+# only -- no gold labels touch it -- because anything fitted on the 58 annotated
+# studies leaks into a validation set of the same 58, which is exactly what made
+# the old generated labels read 0.906 OOF and score 0.791.
+#
+# The measurement is simply: how often does a report say anything at all about
+# this finding? Synovitis is UNK in 84% of reports and fracture in 56%, so for
+# those two the text is silent far more often than it speaks, and a silence
+# carries almost no information about whether the finding is present. Weighting
+# every class equally tells the model to trust a near-empty channel as much as
+# a full one.
+#
+# RSNA_CLASS_WEIGHT=0 restores uniform weighting.
+USE_CLASS_WEIGHT = os.environ.get("RSNA_CLASS_WEIGHT", "1") == "1"
+CLASS_W = None      # set once labels load; None = uniform
+CLASS_WEIGHT_FLOOR = float(os.environ.get("RSNA_CLASS_WEIGHT_FLOOR", 0.35))
+
+
+def class_informativeness(labels_df, targets):
+    """
+    Per-target multiplier in [floor, 1.0], from the share of reports that give
+    a verdict other than UNK. Returns all-ones when the file has no verdict
+    columns, so a label file without them behaves exactly as before.
+    """
+    vcols = [t + "__verdict" for t in targets]
+    if not all(c in labels_df.columns for c in vcols):
+        return {t: 1.0 for t in targets}, None
+    out, spoken = {}, {}
+    for t in targets:
+        v = labels_df[t + "__verdict"].astype(str)
+        frac = float((v != "UNK").mean())
+        spoken[t] = frac
+        # scale linearly from the least-spoken class to the most, then floor it
+        out[t] = frac
+    lo, hi = min(out.values()), max(out.values())
+    for t in targets:
+        z = (out[t] - lo) / max(hi - lo, 1e-6)
+        out[t] = CLASS_WEIGHT_FLOOR + (1.0 - CLASS_WEIGHT_FLOOR) * z
+    return out, spoken
+
+
+# Re-scoring UNK. The ladder maps every UNK to 0.28 regardless of finding, and
+# measured against the annotated studies that single number is wrong in both
+# directions at once: a report silent on synovitis still has a ~1-in-3 chance of
+# the finding being there, while silence on ACL, MCL, medial OA, lateral OA,
+# effusion or a Baker cyst means it is almost certainly absent. A flat 0.28
+# therefore over-calls six findings and under-calls two.
+#
+# The correction has to be CROSS-FITTED. P(positive | UNK) can only be measured
+# on annotated studies, and those same studies are the validation set, so
+# fitting on all of them and then validating on all of them is the leak that
+# produced 0.906 OOF against 0.791 on the leaderboard. Each fold therefore
+# estimates its own mapping from the gold studies OUTSIDE its validation split,
+# shrunk toward the original ladder value so a cell with four studies in it
+# cannot swing the score on its own.
+# OFF by default, and it should stay off unless the cost below is paid.
+# Doing this honestly means each Stage B fold needs a Stage A trained on weak
+# labels rescored from that fold's TRAINING gold only -- five Stage A runs
+# instead of one. Rescoring once from all 58 and reusing it is the same shape of
+# mistake as the generated labels: the number goes up and the leaderboard does
+# not follow.
+RESCORE_UNK = os.environ.get("RSNA_RESCORE_UNK", "0") == "1"
+UNK_SHRINK_K = float(os.environ.get("RSNA_UNK_SHRINK", 12.0))   # pseudo-counts
+
+
+def unk_rescore_map(labels_df, gold_ids, targets, base=0.28, k=UNK_SHRINK_K):
+    """
+    P(positive | verdict == UNK) per target, from gold_ids ONLY.
+
+    gold_ids must exclude the fold being validated. Shrinkage is a Beta prior
+    centred on the existing ladder value with k pseudo-counts, so a target whose
+    UNK cell is nearly empty keeps 0.28 and one with forty studies in it moves
+    most of the way to what those studies show.
+    """
+    vcols = [t + "__verdict" for t in targets]
+    if not all(c in labels_df.columns for c in vcols) or not len(gold_ids):
+        return {t: base for t in targets}
+    sub = labels_df[labels_df["StudyInstanceUID"].isin(gold_ids)]
+    out = {}
+    for t in targets:
+        m = sub[t + "__verdict"].astype(str) == "UNK"
+        nn = int(m.sum())
+        if nn == 0:
+            out[t] = base
+            continue
+        p = float(sub.loc[m, t].astype(float).mean())
+        out[t] = (nn * p + k * base) / (nn + k)
+    return out
+
+
+def apply_unk_rescore(labels_df, targets, unk_map):
+    """Rewrite UNK scores in place on a copy; YES and NO are left alone."""
+    d = labels_df.copy()
+    for t in targets:
+        vc = t + "__verdict"
+        if vc not in d.columns:
+            continue
+        m = d[vc].astype(str) == "UNK"
+        d.loc[m, t] = unk_map.get(t, 0.28)
+    return d
+
+
+def soft_label_weight(y_soft, is_real, conf=None, class_w=None):
     """
     Confidence weight per (study, target) pair.
       Real (official) label -> 3.0, full trust.
@@ -1674,6 +1797,11 @@ def soft_label_weight(y_soft, is_real, conf=None):
             3.0,
             0.25 + 0.75 * (2.0 * np.abs(y_soft - 0.5)).clip(0, 1),
         )
+    if class_w is not None:
+        # applied to the WEAK rows only -- a real 0/1 annotation is trustworthy
+        # for every finding regardless of how often reports discuss it
+        cw = np.asarray([class_w.get(t, 1.0) for t in TARGETS], dtype=np.float32)
+        w = np.where(is_real[:, None], w, w * cw[None, :])
     return w.astype(np.float32)
 
 
@@ -1713,7 +1841,7 @@ def predict_xgb(models, X):
 
 
 def main():
-    seed_everything()          # honours RSNA_SEED
+    seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # local flag (not the module-level XGB_AVAILABLE) so any failure inside
     # main() can disable the stacking layer for this run only, cleanly
@@ -1727,6 +1855,7 @@ def main():
     print(f"       slot_pool={SLOT_POOL}  patch_pool={PATCH_POOL} "
           f"(embed_dim={EMBED_DIM})")
     print(f"       crop_mm={CROP_MM}  rgb_mode={RGB_MODE}")
+    print(f"       class_weight={USE_CLASS_WEIGHT}  rescore_unk={RESCORE_UNK}")
     if TTA_WINDOWS:
         print(f"       tta_windows={TTA_WINDOWS} group={TTA_GROUP} pool={TTA_POOL}")
     print(f"Device  : {device}")
@@ -1786,6 +1915,15 @@ def main():
     labeled = pd.concat([real_df, weak_sample], ignore_index=True)
     print(f"Training pool total            : {len(labeled)} "
           f"({len(real_df)} real + {len(weak_sample)} weak)")
+
+    global CLASS_W
+    CLASS_W, SPOKEN = (class_informativeness(labeled, TARGETS)
+                       if USE_CLASS_WEIGHT else ({t: 1.0 for t in TARGETS}, None))
+    if SPOKEN is not None:
+        print("Per-class label reliability (share of reports that say anything):")
+        for t in TARGETS:
+            print(f"  {t:18s} spoken {100*SPOKEN[t]:5.1f}%   weight {CLASS_W[t]:.3f}")
+    GOLD_IDS = set(real_df["StudyInstanceUID"].astype(str))
 
     # Per-target confidence straight from the labeller, when present.
     CONF_COLS = [t + "__conf" for t in TARGETS]
@@ -1990,7 +2128,8 @@ def main():
             _cc = [t + "__conf" for t in TARGETS]
             C_pool = (_li.loc[pretrain_ids, _cc].values.astype(np.float32)
                       if all(c in _li.columns for c in _cc) else None)
-            W_pool = soft_label_weight(Y_pool, is_real_pool, conf=C_pool)
+            W_pool = soft_label_weight(Y_pool, is_real_pool, conf=C_pool,
+                                       class_w=CLASS_W)
             X_pool = make_features(raw_embed, presence, xgb_pca)
 
             if xgb_stage_a_path.exists():
