@@ -1,0 +1,24 @@
+{
+  "name_a": "honest839",
+  "name_b": "runD",
+  "auc_a": 0.9076190974881143,
+  "auc_b": 0.8672211341187821,
+  "global_alpha": 0.8500000000000001,
+  "adopt_global": false,
+  "auc_global": 0.9088220044088057,
+  "auc_per_class": 0.9076190974881143,
+  "per_class_alpha": {
+    "ACL": 1.0,
+    "MCL": 1.0,
+    "Medial Meniscus": 1.0,
+    "Lateral Meniscus": 1.0,
+    "Medial OA": 1.0,
+    "Lateral OA": 1.0,
+    "PF OA": 1.0,
+    "Effusion": 1.0,
+    "Synovitis": 1.0,
+    "Baker's": 1.0,
+    "Contusion": 1.0,
+    "Fracture": 1.0
+  }
+}
