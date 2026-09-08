@@ -290,7 +290,28 @@ SLOT_NAMES = [
 ]
 N_SLOT    = len(SLOT_NAMES)
 EMBED_DIM_BASE = 1152
-PROJ_DIM  = 256
+PROJ_DIM  = int(os.environ.get("RSNA_PROJ_DIM", 256))
+
+# Stage B fits ~516k parameters against 46 training studies -- about 935
+# parameters per individual label value -- so the regularisation is deliberately
+# strong. 0.15 was a default carried over from settings tuned on datasets with
+# thousands of labels.
+DROPOUT   = float(os.environ.get("RSNA_DROPOUT", 0.40))
+
+# Training schedule. Stage A val_auc peaked around epoch 13 at lr=1e-4 and then
+# declined for the remaining seventeen, so the old 30 epochs bought nothing the
+# best-epoch checkpoint did not already have. A larger step covers the same
+# ground in fewer rounds -- 6e-4 is six times the old rate, which is a real
+# change and not a tweak: watch epochs 1-5, and if val_auc lurches rather than
+# climbing steadily the step is too big.
+#
+# Stage B peaked at epoch 1-3 of 15 on every fold. Forty-six studies is not
+# enough to learn from for long, so the extra rounds were memorisation.
+STAGE_A_LR     = float(os.environ.get("RSNA_A_LR", 6e-4))
+STAGE_A_EPOCHS = int(os.environ.get("RSNA_A_EPOCHS", 20))
+STAGE_B_LR     = float(os.environ.get("RSNA_B_LR", 2e-5))
+STAGE_B_EPOCHS = int(os.environ.get("RSNA_B_EPOCHS", 10))
+WEIGHT_DECAY   = float(os.environ.get("RSNA_WD", 1e-3))
 
 # Patch-level pooling. get_image_features returns ONE pooled vector per image,
 # which averages every patch in the field. A meniscal tear occupies a small part
@@ -308,16 +329,28 @@ EMBED_DIM  = EMBED_DIM_BASE * POOL_PARTS
 # Raised to process more of each series. 12 slices from the middle 60%
 # used only ~31% of the DICOMs on disk. 20 slices from the middle 76%
 # roughly doubles coverage. Encoding time scales linearly with this.
-MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 20))
+# Every slice, not a sampled twenty. The cost is real: ~800k images encoded
+# instead of ~427k, so roughly 3.5h to embed instead of 1h45m, and each study
+# now hands the model a variable number of rows rather than a fixed twenty.
+MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 9999))
 BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", 16))
 # 6-94%, not 12-88%. The collateral ligaments and the lateral meniscus sit in
 # the peripheral slices a tighter band discards, and those are two of the
 # weakest classes in this pipeline.
-SLICE_BAND  = (float(os.environ.get("RSNA_BAND_LO", 0.06)),
-               float(os.environ.get("RSNA_BAND_HI", 0.94)))
+# The whole stack. Banding existed to drop the first and last slices, which sit
+# outside the joint, but with MAX_SLICES unbounded there is no surplus to trim
+# and the peripheral slices are where the collateral ligaments live.
+SLICE_BAND  = (float(os.environ.get("RSNA_BAND_LO", 0.0)),
+               float(os.environ.get("RSNA_BAND_HI", 1.0)))
 LAT_OFFSET  = 20.0
 PRIOR_STRENGTH = 0.55
-WINDOW_PCT     = (0.5, 99.5)     # FIX #16 (was 1, 99)
+# Intensity windowing cannot be switched off -- MRI pixel values carry no
+# absolute meaning, so some range must be mapped to 0-255 or the image is
+# unusable. 0.1/99.9 is as close to "off" as is safe: it still discards the
+# single hot pixel or metal artefact that would otherwise set the ceiling and
+# compress every real tissue value into a narrow band of grey.
+WINDOW_PCT  = (float(os.environ.get("RSNA_WIN_LO", 0.1)),
+               float(os.environ.get("RSNA_WIN_HI", 99.9)))
 
 # RUN A switches. All default ON; set the env var to 0 to disable one and
 # isolate its effect. None of these require a re-encode.
@@ -343,14 +376,19 @@ SLOT_POOL = os.environ.get("RSNA_SLOT_POOL", "mix").lower()
 # scale-invariance it should never have needed. Cropping a fixed CROP_MM box
 # around the image centre using PixelSpacing makes the knee occupy the same
 # fraction of the frame whatever the scanner did.
-CROP_MM = float(os.environ.get("RSNA_CROP_MM", 140.0))   # 0 disables
+# Off. Measured: with the 140 mm crop the leaderboard went 0.839 -> 0.827, and
+# the per-class picture says why -- effusion is diffuse and extends past the
+# box, so cropping cut more signal there than it sharpened elsewhere.
+CROP_MM = float(os.environ.get("RSNA_CROP_MM", 0.0))
 
 # Three neighbouring slices in the three colour channels. SigLIP wants three
 # channels and a grey slice was being copied into all three, so two thirds of
 # the input carried no information. Filling them with the slices above and
 # below gives the encoder local depth context at no extra cost -- most of what
 # a 3D network buys, for the price of a 2D one.
-RGB_MODE = os.environ.get("RSNA_RGB_MODE", "neighbours").lower()   # or "gray"
+# Grayscale triplication, as in the 0.839 model. Neighbour-RGB has only ever run
+# bundled with the crop, so it has never been tested on its own.
+RGB_MODE = os.environ.get("RSNA_RGB_MODE", "gray").lower()
 
 # Sliding-window TTA. The embedding cache already holds every slice, so looking
 # at more of them at inference costs forward passes and no extra decoding. The
@@ -1193,13 +1231,13 @@ class SlotAttentionModel(nn.Module):
             nn.LayerNorm(EMBED_DIM),
             nn.Linear(EMBED_DIM, PROJ_DIM),
             nn.GELU(),
-            nn.Dropout(0.15),
+            nn.Dropout(DROPOUT),
         )
         self.att = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)          # within-slot
         self.slot_att = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)     # across-slot
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(PROJ_DIM), nn.Linear(PROJ_DIM, 64),
-                          nn.GELU(), nn.Dropout(0.15), nn.Linear(64, 1))
+                          nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(64, 1))
             for _ in TARGETS
         ])
 
@@ -1400,7 +1438,8 @@ def train_fold(train_ds, val_ds, device, epochs):
         model = torch.compile(model)
     except Exception:
         pass  # older PyTorch — skip compile
-    opt     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    opt     = torch.optim.AdamW(model.parameters(), lr=STAGE_A_LR,
+                                weight_decay=WEIGHT_DECAY)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -1458,13 +1497,15 @@ def train_fold(train_ds, val_ds, device, epochs):
     return model
 
 
-def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
+def finetune_fold(model, train_ds, val_ds, device, epochs, lr=None):
+    lr = STAGE_B_LR if lr is None else lr
     """
     Same loop as train_fold, but takes an already-initialized model (e.g.
     Stage A weak-label weights) and fine-tunes it with a smaller LR instead
     of training from scratch. Used for Stage B (58 real labels).
     """
-    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt     = torch.optim.AdamW(model.parameters(), lr=lr,
+                                weight_decay=WEIGHT_DECAY)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -1687,7 +1728,13 @@ def make_features(raw_embed, mask, pca, extra=None):
 # a full one.
 #
 # RSNA_CLASS_WEIGHT=0 restores uniform weighting.
-USE_CLASS_WEIGHT = os.environ.get("RSNA_CLASS_WEIGHT", "1") == "1"
+# Off. Measured: down-weighting the classes reports rarely mention took OOF
+# from 0.908 to 0.894, and the two weighted down hardest -- synovitis and
+# fracture -- got WORSE, not better. Rarely-mentioned is not the same as
+# uninformative: when a report does name synovitis, P(positive) is 0.81, the
+# highest of any finding. The weighting discarded the sparse strong cases along
+# with the silence.
+USE_CLASS_WEIGHT = os.environ.get("RSNA_CLASS_WEIGHT", "0") == "1"
 CLASS_W = None      # set once labels load; None = uniform
 CLASS_WEIGHT_FLOOR = float(os.environ.get("RSNA_CLASS_WEIGHT_FLOOR", 0.35))
 
@@ -1856,6 +1903,9 @@ def main():
           f"(embed_dim={EMBED_DIM})")
     print(f"       crop_mm={CROP_MM}  rgb_mode={RGB_MODE}")
     print(f"       class_weight={USE_CLASS_WEIGHT}  rescore_unk={RESCORE_UNK}")
+    print(f"       dropout={DROPOUT}  proj_dim={PROJ_DIM}  wd={WEIGHT_DECAY}")
+    print(f"       stageA lr={STAGE_A_LR} ep={STAGE_A_EPOCHS} | "
+          f"stageB lr={STAGE_B_LR} ep={STAGE_B_EPOCHS}")
     if TTA_WINDOWS:
         print(f"       tta_windows={TTA_WINDOWS} group={TTA_GROUP} pool={TTA_POOL}")
     print(f"Device  : {device}")
@@ -2074,7 +2124,7 @@ def main():
                                       lbl[lbl["StudyInstanceUID"].isin(sa_va_ids)])
             print(f"\nStage A FOLD {sa_fold}  train={len(pre_tr_ds)}  val={len(pre_va_ds)}")
 
-            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30)
+            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=STAGE_A_EPOCHS)
 
             # evaluate this fold
             sa_model.eval()
@@ -2253,7 +2303,8 @@ def main():
                 print(f"\nFOLD {fold}  train={len(tr_ds)}  val={len(va_ds)}")
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, pretrained_model.state_dict())
-                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, lr=2e-5)
+                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device,
+                                           epochs=STAGE_B_EPOCHS, lr=STAGE_B_LR)
 
             fold_model.eval()
             Y, P = [], []
