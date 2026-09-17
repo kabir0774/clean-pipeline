@@ -285,9 +285,20 @@ PROJ_DIM  = 256
 # Raised to process more of each series. 12 slices from the middle 60%
 # used only ~31% of the DICOMs on disk. 20 slices from the middle 76%
 # roughly doubles coverage. Encoding time scales linearly with this.
-MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 20))
+# RUN F: process every slice of every series, no depth band, wider window.
+MAX_SLICES  = int(os.environ.get("RSNA_MAX_SLICES", 9999))
 BATCH_SIZE  = int(os.environ.get("RSNA_BATCH_SIZE", 16))
-SLICE_BAND  = (0.12, 0.88)
+SLICE_BAND  = (float(os.environ.get("RSNA_BAND_LO", 0.0)),
+               float(os.environ.get("RSNA_BAND_HI", 1.0)))
+WINDOW_PCT  = (float(os.environ.get("RSNA_WIN_LO",  0.1)),
+               float(os.environ.get("RSNA_WIN_HI", 99.9)))
+DROPOUT     = float(os.environ.get("RSNA_DROPOUT", 0.40))
+# RUN F training schedule
+STAGE_A_LR     = float(os.environ.get("RSNA_A_LR",     6e-4))
+STAGE_A_EPOCHS = int(os.environ.get("RSNA_A_EPOCHS",   20))
+STAGE_B_LR     = float(os.environ.get("RSNA_B_LR",     2e-5))
+STAGE_B_EPOCHS = int(os.environ.get("RSNA_B_EPOCHS",   10))
+WEIGHT_DECAY   = float(os.environ.get("RSNA_WD",       1e-3))
 LAT_OFFSET  = 20.0
 PRIOR_STRENGTH = 0.55
 
@@ -778,7 +789,7 @@ def arrays_to_pils(arrays):
     if not arrays:
         return []
     flat = np.concatenate([a.ravel() for a in arrays])
-    lo, hi = np.percentile(flat, [1, 99])
+    lo, hi = np.percentile(flat, list(WINDOW_PCT))
     if hi <= lo:
         lo, hi = float(flat.min()), float(flat.max())
     out = []
@@ -960,12 +971,12 @@ class SlotAttentionModel(nn.Module):
             nn.LayerNorm(EMBED_DIM),
             nn.Linear(EMBED_DIM, PROJ_DIM),
             nn.GELU(),
-            nn.Dropout(0.15),
+            nn.Dropout(DROPOUT),
         )
         self.att   = nn.Linear(PROJ_DIM, len(TARGETS), bias=False)
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(PROJ_DIM), nn.Linear(PROJ_DIM, 64),
-                          nn.GELU(), nn.Dropout(0.15), nn.Linear(64, 1))
+                          nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(64, 1))
             for _ in TARGETS
         ])
         prior = torch.zeros(len(TARGETS), N_SLOT)
@@ -1084,7 +1095,7 @@ def train_fold(train_ds, val_ds, device, epochs):
         model = torch.compile(model)
     except Exception:
         pass  # older PyTorch — skip compile
-    opt     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    opt     = torch.optim.AdamW(model.parameters(), lr=STAGE_A_LR, weight_decay=WEIGHT_DECAY)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -1127,13 +1138,14 @@ def train_fold(train_ds, val_ds, device, epochs):
     return model
 
 
-def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
+def finetune_fold(model, train_ds, val_ds, device, epochs, lr=None):
     """
     Same loop as train_fold, but takes an already-initialized model (e.g.
     Stage A weak-label weights) and fine-tunes it with a smaller LR instead
     of training from scratch. Used for Stage B (58 real labels).
     """
-    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    lr      = STAGE_B_LR if lr is None else lr
+    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -1617,7 +1629,7 @@ def main():
                                       lbl_a[lbl_a["StudyInstanceUID"].isin(sa_va_ids)])
             print(f"\nStage A FOLD {sa_fold}  train={len(pre_tr_ds)}  val={len(pre_va_ds)}")
 
-            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30)
+            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=STAGE_A_EPOCHS)
 
             # evaluate this fold
             sa_model.eval()
@@ -1808,7 +1820,8 @@ def main():
                 print(f"\nFOLD {fold}  train={len(tr_ds)}  val={len(va_ds)}")
                 fold_model = SlotAttentionModel().to(device)
                 fold_model = load_state_dict_safe(fold_model, pretrained_model.state_dict())
-                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, lr=2e-5)
+                fold_model = finetune_fold(fold_model, tr_ds, va_ds, device,
+                                           epochs=STAGE_B_EPOCHS, lr=STAGE_B_LR)
 
             fold_model.eval()
             Y, P = [], []
